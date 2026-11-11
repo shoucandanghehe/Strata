@@ -783,9 +783,9 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=save"    -H "Content-Type: ap
 curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
 ```
 
-DFlash2 saves use a v2 extension for the drafter's private ring, tags, token history, activation log and deferred
-context. The model identity includes its pack and draft vocabulary, and the configuration includes ring-log mode.
-Files without DFlash2 retain the v1 bytes.
+On CUDA/HIP, DFlash2 saves use a v2 extension for the drafter's private ring, tags, token history, activation log
+and deferred context. The model identity includes its pack and draft vocabulary, and the configuration includes
+ring-log mode. Files without DFlash2 retain the v1 bytes. This extension is not supported on Metal or SYCL.
 
 - `DIR` becomes an absolute path at start and is created with mode 0700. Files are created with mode 0600 on Linux (on Windows
   they inherit the folder's permissions), nothing deletes them, and they are large (about 1.2 GB per 63K-token conversation).
@@ -815,8 +815,9 @@ Files without DFlash2 retain the v1 bytes.
 #### Automatic session cache (opt-in)
 
 `--session-cache-dir DIR --session-cache-mib N` enables the native background cache. It is off by default: no cache
-thread or storage access is started. It supports single-session MTP and DFlash2 on one GPU, with `--prompt-cache`
-above zero, no helper expert caches, no parallel slots and no layer split.
+thread or storage access is started. It supports single-session MTP and DFlash2 on one CUDA/HIP GPU, with
+`--prompt-cache` above zero, no helper expert caches, no parallel slots and no layer split.
+Metal and SYCL are not supported.
 
 `--session-cache-slots N` limits logical conversations (default 8). `--session-cache-idle-seconds N` delays a completed
 conversation's save until it is idle (default 60); `--session-cache-min-tokens N` sets its minimum input length

@@ -1514,8 +1514,11 @@ class StrataEngine:
 
     def unload(self):
         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
-        self.close()
-        self.unloaded = True
+        try:
+            self.close()
+        finally:
+            if self.proc is None:
+                self.unloaded = True
 
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
@@ -5562,7 +5565,7 @@ class Service:
                 time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
                 try:
                     self.unload(idle_for=self.idle_unload_s)
-                except EngineStuck as e:                # tried again at the next turn; the thread keeps running
+                except (EngineStuck, EngineDied, SessionRefused) as e:   # report failed writes; keep the idle loop running
                     print(f"[strata] idle unload: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
@@ -8249,7 +8252,10 @@ def make_handler(svc: Service):
                     wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
                                          svc.UNLOAD_WAIT_S)
                     r = svc.unload_waiting(wait_s) if wait_s else svc.unload()
-                except EngineStuck as e:
+                except SessionRefused as e:
+                    self._json(max(500, e.status), {"error": {"type": "server_error", "message": str(e), "kind": e.kind}})
+                    return
+                except (EngineStuck, EngineDied) as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 self._json(409 if r == "busy" else 200, {"status": r})
@@ -8297,7 +8303,13 @@ def make_handler(svc: Service):
                     if path == "/v1/unload":
                         wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
                                              svc.UNLOAD_WAIT_S)
-                        result = svc.unload_waiting(wait_s) if wait_s else svc.unload()
+                        # A shutdown failure is a server/storage error, not a malformed request (SessionRefused
+                        # inherits ValueError). Keep it ahead of the outer request validation handler.
+                        try:
+                            result = svc.unload_waiting(wait_s) if wait_s else svc.unload()
+                        except SessionRefused as e:
+                            self._json(max(500, e.status), {"error": {"type": "server_error", "message": str(e), "kind": e.kind}})
+                            return
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
                     else:
