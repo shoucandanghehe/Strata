@@ -634,6 +634,43 @@ class ConcurrentSlots(FakeEngineCase):
             self.engine.proc, self.engine.lines = old_proc, old_lines
             self.engine.slot_busy, self.engine.slot_claims, self.engine.slot_held = old_busy, old_claims, old_held
 
+    def test_restart_before_claim_revalidates_the_fitted_slot_range(self):
+        paused, resume = threading.Event(), threading.Event()
+        output = {}
+        from serve import server
+        filename_check = server.slot_filename_problem
+        def pause(filename):
+            paused.set()                                # the old code has read batch/range but holds no slot
+            if not resume.wait(5):
+                raise RuntimeError("pre-claim barrier was not released")
+            return filename_check(filename)
+        worker = threading.Thread(target=lambda: output.update(result=self.post_slot(1, "save", "old-range.bin")))
+        old_proc, old_busy = self.engine.proc, self.engine.slot_busy
+        real_popen = server.subprocess.Popen
+        script = Path(self.tmp.name, "fake_strata.py")
+        with mock.patch("serve.server.slot_filename_problem", side_effect=pause):
+            worker.start()
+            try:
+                self.assertTrue(paused.wait(5))
+                self.assertEqual(self.engine.slot_claims, set())
+                with mock.patch("serve.server.subprocess.Popen",
+                               lambda cmd, **kw: real_popen([sys.executable, str(script), *cmd[1:], "--fit", "0"], **kw)):
+                    self.engine.restart(tries=1)
+                self.assertIsNot(self.engine.proc, old_proc)
+                self.assertTrue(self.engine.alive())
+                self.assertEqual(self.engine.batch, 0)
+            finally:
+                resume.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(output["result"], (400, {"error": {"code": 400, "message": "this server has one slot: 0",
+                                                           "type": "invalid_request_error"}}))
+        self.assertEqual(self.engine.slot_busy, [])
+        self.assertEqual(self.engine.slot_claims, set())
+        self.assertEqual(old_busy, [False, False])
+        self.assertEqual(self.svc.status["queued"], 0)
+        self.assertEqual(self.commands(), [])
+
     def test_new_process_cannot_take_slot_files_before_its_queues_and_tables_are_ready(self):
         old_proc, old_lines = self.engine.proc, self.engine.lines
         old_busy, old_claims = self.engine.slot_busy, self.engine.slot_claims

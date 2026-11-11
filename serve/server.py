@@ -5081,13 +5081,6 @@ class Service:
                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
-        batch = getattr(self.engine, "batch", 0)
-        if batch and (not (getattr(self.engine, "info", {}) or {}).get("session_slots") or
-                      getattr(self.engine, "slot_groups", 1) > 1):
-            return error(501, "slot save/restore is not available with these parallel requests")
-        if slot not in [str(i) for i in range(batch or 1)]:
-            return error(400, f"this server has slots 0..{batch - 1}" if batch else "this server has one slot: 0")
-        slot_id = int(slot)
         if action not in ("save", "restore"):
             return error(400, "action must be save or restore")
         why = slot_filename_problem(filename)
@@ -5105,17 +5098,26 @@ class Service:
         waiting = True
         try:
             with contextlib.ExitStack() as turn:
-                if batch:
-                    engine = self.engine
-                    with engine.slot_cv:
-                        if not engine.alive():
-                            return error(503, "the model is not loaded")
+                engine = self.engine
+                with getattr(engine, "slot_cv", contextlib.nullcontext()):
+                    if not self.loaded():
+                        return error(503, "the model is not loaded")
+                    # Mode, capability and range belong to the ready process whose tables are claimed below.
+                    batch = getattr(engine, "batch", 0)
+                    if batch and (not (getattr(engine, "info", {}) or {}).get("session_slots") or
+                                  getattr(engine, "slot_groups", 1) > 1):
+                        return error(501, "slot save/restore is not available with these parallel requests")
+                    if slot not in [str(i) for i in range(batch or 1)]:
+                        return error(400, f"this server has slots 0..{batch - 1}" if batch else "this server has one slot: 0")
+                    slot_id = int(slot)
+                    proc = getattr(engine, "proc", None)
+                    if batch:
                         busy, claims, held = engine.slot_busy, engine.slot_claims, engine.slot_held
-                        proc = engine.proc
                         if busy[slot_id] or slot_id in claims or slot_id in engine.slot_releasing:
                             return error(409, f"slot {slot_id} is busy")
                         busy[slot_id] = True
                         claims.add(slot_id)
+                if batch:
                     def release_slot():
                         with engine.slot_cv:
                             busy[slot_id] = False
@@ -5127,7 +5129,7 @@ class Service:
                 with self.status_lock:
                     self.status["queued"] -= 1
                 waiting = False
-                if not self.loaded() or (batch and (self.engine.proc is not proc or
+                if not self.loaded() or getattr(self.engine, "proc", None) is not proc or (batch and (
                         busy is not self.engine.slot_busy or claims is not self.engine.slot_claims)):
                     return error(503, "the model is not loaded")
                 if not batch:
