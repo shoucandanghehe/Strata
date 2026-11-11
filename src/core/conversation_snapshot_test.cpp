@@ -1,5 +1,6 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/session_cache.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include <cuda_runtime.h>
 
@@ -62,10 +63,10 @@ struct Fixture {
             cuda_check(cudaMalloc(&raw, n)); device.push_back(raw); p = static_cast<T*>(raw);
         }
     }
-    Fixture(int fmt, int mode) {
+    Fixture(int fmt, int mode, int64_t pages = 24) {
         auto& st = state;
         st.kv_mode = mode; st.kv_int8 = fmt==kKvInt8; st.kv_q4 = fmt==kKvQ4; st.kv_hybrid = fmt==3;
-        st.n_pages = 24; st.n_slots = mode ? 4 : st.n_pages;
+        st.n_pages = pages; st.n_slots = mode ? 4 : st.n_pages;
         st.max_cells = st.n_pages * 4; st.idx_pooled_rows = mode==2 ? 2 : st.max_cells/4+2;
         const size_t per = fmt==kKvQ4 ? kv_q4_bytes_per_head((int)g.head_dim) : g.head_dim*((st.kv_int8 || st.kv_hybrid) ? 1:2);
         const size_t rows = st.max_cells*g.n_head_kv, slot_rows = st.n_slots*4*g.n_head_kv;
@@ -298,8 +299,33 @@ void full_session(int fmt, int mode, int experts) {
               "a stage image holds the session's own layers, no draft");
         check(stage.bytes()<a.bytes(),"a stage image is smaller by the draft ring");
         check(conversation_snapshot_validate(stage,ss,g,nullptr,err),"validate a stage image without a draft");
+        SessionReadLimits limits;
+        check(conversation_session_read_limits(limits,ss,g,nullptr,96,6,err),"session cache limits without MTP");
+        check(limits.max_kv_layers==stage.kv.size(),"cache limits describe only the real target layers");
         check(!conversation_snapshot_validate(stage,ss,g,draft.state,err),"a stage image is refused where a draft is expected");
         check(!conversation_snapshot_validate(a,ss,g,nullptr,err),"an image with a draft is refused where none is expected");
+        {
+            SavedConversation meta, disk;
+            std::vector<SessionKvSource> sources;
+            check(conversation_snapshot_sources(meta,sources,view,ss,g,nullptr,err),"target-only streamed sources");
+            check(sources.size()==stage.kv.size(),"target-only file has no synthetic MTP source");
+            namespace fs=std::filesystem;
+            const auto path=fs::temp_directory_path()/("strata-target-file-"+std::to_string(experts)+"-"+
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".bin");
+            size_t bytes=0;
+            const SessionFileIdentity identity{1,2};
+            check(session_file_write(path.string(),meta,sources,identity,bytes,err),"write target-only streamed file");
+            check(session_file_read(path.string(),identity,disk,bytes,err,limits),"read bounded target-only file");
+            check(disk.live.ids==stage.live.ids && disk.live.imgs==stage.live.imgs &&
+                  disk.live.gdn==stage.live.gdn && disk.live.ple==stage.live.ple &&
+                  disk.live.tails==stage.live.tails && disk.live.dead==stage.live.dead &&
+                  disk.live.block_pos==stage.live.block_pos && disk.checkpoints.size()==stage.checkpoints.size() &&
+                  disk.kv.size()==stage.kv.size() && equal(disk.kv[0],stage.kv[0]),
+                  "target-only file retains the actual target state");
+            stage=std::move(disk);
+            std::error_code ec;
+            fs::remove(path,ec);
+        }
         fill(201);
         check(snap_save(stage_b,view,ss,g,nullptr,err),"capture another stage state");
         check(conversation_snapshot_restore(a,ss,g,nullptr,err)==ConversationRestore::invalid,
@@ -331,6 +357,94 @@ void full_session(int fmt, int mode, int experts) {
     cuda_check(cudaMemcpy(spare.data(),main.state.idx_pooled,sizes.dead,cudaMemcpyDeviceToHost));
     check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
+}
+
+void disk_session_snapshot() {
+    constexpr int64_t used = 4101, shared = 4096, pages = 1027; // 4108 cells, one complete shared chunk
+    Fixture main(kKvInt8,1,pages), draft(kKvInt8,2,pages);
+    auto& g=main.g;
+    g.n_layers=4; g.n_expert=256;
+    g.ssm_state_size=2; g.ssm_v_heads=2; g.ssm_conv_channels=8;
+    SessionState ss;
+    ss.max_cells=main.state.max_cells; ss.qsa_states=&main.state;
+    ss.layer_hi=g.n_layers; ss.gdn_alloc=g.n_gdn_layers(); ss.qsa_alloc=g.n_qsa_layers();
+    std::string err;
+    ConversationStateSizes sizes;
+    check(conversation_state_sizes(g,sizes,err),"disk-cache GPU fixture state sizes");
+    main.alloc(ss.gdn_state,sizes.gdn); main.alloc(ss.ple_hist,sizes.ple);
+    main.alloc(main.state.idx_tail,sizes.tail); main.alloc(main.state.idx_dead,sizes.dead);
+    main.alloc(main.state.idx_block_pos,sizes.block_pos);
+    std::vector<int32_t> ids((size_t)used);
+    for (size_t i=0;i<ids.size();++i) ids[i]=(int32_t)i+1;
+    std::vector<ConversationImageKey> images;
+    std::vector<ConversationCheckpoint> checkpoints;
+    const ConversationView view{ids,images,checkpoints,true};
+    auto fill_running=[&](uint8_t salt) {
+        for (const auto& [p,n] : std::vector<std::pair<void*,size_t>>{
+                 {ss.gdn_state,sizes.gdn},{ss.ple_hist,sizes.ple},{main.state.idx_tail,sizes.tail},
+                 {main.state.idx_dead,sizes.dead},{main.state.idx_block_pos,sizes.block_pos}})
+            cuda_check(cudaMemset(p,salt,n));
+        cuda_check(cudaMemcpy(main.state.idx_pooled+(used/4)*g.idx_key_dim,
+                              main.state.idx_dead,sizes.dead,cudaMemcpyDeviceToDevice));
+        cuda_check(cudaDeviceSynchronize());
+    };
+    SavedConversation a,b;
+    main.fill(13); draft.fill(13); fill_running(13);
+    check(snap_save(a,view,ss,g,draft.state,err),"capture first real GPU session with complete disk chunk");
+    conversation_park_join();
+    ids.back()+=10000;
+    main.fill_after(177,shared); draft.fill(177); fill_running(177);
+    check(snap_save(b,view,ss,g,draft.state,err),"independent GPU capture retains prefix and changes private suffix/state/draft");
+    conversation_park_join();
+    check(a.live.gdn!=b.live.gdn && a.live.ple!=b.live.ple && a.live.tails!=b.live.tails &&
+          a.live.dead!=b.live.dead && a.live.block_pos!=b.live.block_pos &&
+          !(a.kv[0].k==b.kv[0].k) && !(a.kv.back().k==b.kv.back().k),
+          "GPU captures actually differ in private running, indexer, main-tail and draft bytes");
+    main.fill(233); draft.fill(233); fill_running(233); // neither captured image is still resident
+    SessionReadLimits limits;
+    check(conversation_session_read_limits(limits,ss,g,draft.state,ss.max_cells,0,err),"real GPU cache read bounds");
+    namespace fs=std::filesystem;
+    const fs::path dir=fs::temp_directory_path()/("strata-disk-snapshot-test-"+
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    {
+        DiskSessionCache cache(dir.string(),64u<<20,2,{1,2},std::move(limits));
+        cache.submit({a.live.ids,a.live.imgs,a.cvec},a,{1});
+        check(cache.flush(err),"first GPU capture reaches durable session-cache publication");
+        DiskSessionCache::Stats first,second;
+        check(cache.take_stats(first) && first.storage.entries==1 && first.storage.blocks==4,
+              "real GPU INT8 main K/V and scales produce four completed physical chunks");
+        cache.submit({b.live.ids,b.live.imgs,b.cvec},b,{1});
+        check(cache.flush(err),"second GPU capture reaches durable session-cache publication");
+        check(cache.take_stats(second) && second.storage.entries==2 && second.storage.blocks==first.storage.blocks &&
+              second.storage.reused_bytes>0,"second real GPU session reuses all prefix blocks while retaining both owners");
+        for (const SavedConversation* expected : {&a,&b}) {
+            std::vector<int64_t> prompt(expected->live.ids.begin(),expected->live.ids.end());
+            prompt.push_back(99999);
+            const auto match=cache.best(prompt,expected->live.imgs,expected->cvec,expected->kv.size());
+            check(match.tokens==used && match.live,"disk metadata selects the exact GPU branch");
+            SavedConversation loaded,observed;
+            size_t bytes=0;
+            check(cache.read(match,loaded,bytes,err),"read real published GPU snapshot through native cache");
+            check(conversation_snapshot_restore(loaded,ss,g,draft.state,err)==ConversationRestore::restored,
+                  "restore native disk image into the actual GPU session and draft ring");
+            const ConversationView restored_view{expected->live.ids,expected->live.imgs,expected->checkpoints,expected->cvec};
+            check(snap_save(observed,restored_view,ss,g,draft.state,err),"read back restored GPU running state and K/V");
+            conversation_park_join();
+            check(observed.live.gdn==expected->live.gdn && observed.live.ple==expected->live.ple &&
+                  observed.live.tails==expected->live.tails && observed.live.dead==expected->live.dead &&
+                  observed.live.block_pos==expected->live.block_pos &&
+                  equal(observed.kv[0],expected->kv[0]) && equal(observed.kv.back(),expected->kv.back()),
+                  "disk restore preserves actual main/draft K/V, GDN, PLE and all indexer bytes for each branch");
+            uint64_t fingerprint=0;
+            check(conversation_kv_verify(expected->kv[0],main.state,g,used,true,fingerprint,err) &&
+                  conversation_kv_verify(expected->kv.back(),draft.state,g,used,false,fingerprint,err),
+                  "disk restore verifies authoritative streamed K/V and resident draft-ring pages on device");
+            check(ss.ple_prev[0]==expected->live.ids[(size_t)used-2] && ss.ple_prev[1]==expected->live.ids.back(),
+                  "disk restore reconstructs the selected branch's real PLE token window");
+        }
+    }
+    std::error_code ec;
+    fs::remove_all(dir,ec);
 }
 }
 
@@ -437,5 +551,6 @@ int main() {
     for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
         full_session(fmt,mode,experts);
     for (int experts : {256,512}) full_session(3,0,experts);
+    disk_session_snapshot();
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
 }

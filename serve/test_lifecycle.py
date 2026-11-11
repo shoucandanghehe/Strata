@@ -3,6 +3,7 @@ import json
 import io
 import os
 import subprocess
+import threading
 import time
 import unittest
 import urllib.error
@@ -11,7 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, EngineStuck, MockEngine, Service, StrataEngine, serve
+from serve.test_parallel import FakeEngineCase
+from serve.server import ByteTokenizer, EngineDied, EngineStuck, MockEngine, Service, SessionRefused, StrataEngine, serve
 
 
 class ResidentEngine(StrataEngine):
@@ -200,6 +202,143 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(self.request("/v1/unload", {})[0], 409)
         self.assertEqual(self.engine.closes, 0)
         self.assertEqual(self.request("/v1/load", {}, {"Content-Type": "text/plain"})[0], 415)
+
+
+class CacheShutdown(FakeEngineCase):
+    def test_closed_input_still_terminates_the_cache_process_before_reporting_failure(self):
+        script = ('import os, time\nos.close(0)\n'
+                  'print("INFO engine=0.1.39 session_cache_async=1", flush=True)\n'
+                  'print("READY 4096 stop", flush=True)\ntime.sleep(60)\n')
+        with mock.patch("serve.test_parallel.FAKE_BATCH", script):
+            self.start(0)
+        process = self.engine.proc
+        try:
+            with self.assertRaises(EngineDied):
+                self.engine.close()
+            self.assertIsNotNone(process.poll())
+            self.assertIsNone(self.engine.proc)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def test_cache_flush_commits_before_quit_and_shutdown_gets_its_bounded_wait(self):
+        self.start(2, more=["--cache-async"])
+        process = self.engine.proc
+        self.engine.silence_s = 0.05
+        with mock.patch("serve.server.ENGINE_QUIT_WAIT_S", 0.05):
+            self.engine.close()
+        self.assertEqual(self.log.read_text().splitlines(), ["FLUSH", "FLUSH committed", "SHUTDOWN committed"])
+        self.assertEqual(process.returncode, 0)
+        self.assertTrue(process.stdin.closed)
+        self.assertIsNone(self.engine.proc)
+
+    def test_close_during_serial_generation_leaves_done_to_its_owner(self):
+        self.start(0, more=["--cache-async", "--session-files"])
+        output, failures = [], []
+        started = threading.Event()
+        def generate():
+            try:
+                for token in self.engine.generate(list(b"LONGREPLY"), 1000, {}, threading.Event()):
+                    if token is not None:
+                        output.append(token)
+                        started.set()
+            except Exception as e:
+                failures.append(e)
+        worker = threading.Thread(target=generate)
+        worker.start()
+        self.assertTrue(started.wait(5))
+        process = self.engine.proc
+        with mock.patch("serve.server.ENGINE_QUIT_WAIT_S", 0.05):
+            self.engine.close()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertTrue(output)
+        commands = self.log.read_text().splitlines()
+        self.assertFalse(any(line.startswith("FLUSH") for line in commands))
+        self.assertEqual(commands[-1], "SHUTDOWN committed")
+        self.assertEqual(process.returncode, 0)
+        self.assertFalse(self.engine.ctl.locked())
+
+    def test_close_during_batch_admission_leaves_done_and_badm_to_the_owner(self):
+        self.start(2, more=["--cache-async", "--session-files"])
+        cancel = [threading.Event(), threading.Event()]
+        started, failures = threading.Event(), []
+        def generate(i):
+            try:
+                ids = list(b"LONGREPLY") + ([1] * 8000 if i else [])
+                for token in self.engine.generate(ids, 1000, {}, cancel[i]):
+                    if token is not None:
+                        started.set()
+            except EngineDied:
+                pass                                    # the sibling's batch stream legitimately ends with the process
+            except Exception as e:
+                failures.append(e)
+        workers = [threading.Thread(target=generate, args=(i,)) for i in range(2)]
+        workers[0].start()
+        self.assertTrue(started.wait(5))
+        workers[1].start()
+        try:
+            deadline = time.monotonic() + 5
+            while not (self.engine.progress and any(
+                    live and live["state"] == "reading" and live["prompt_tokens"] > 8000
+                    for live in self.engine.slot_live)) and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertIsNotNone(self.engine.progress)
+            process = self.engine.proc
+            with mock.patch("serve.server.ENGINE_QUIT_WAIT_S", 0.05):
+                self.engine.close()
+            for worker in workers:
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+            self.assertEqual(process.returncode, 0)
+            self.assertEqual(failures, [])
+            commands = self.log.read_text().splitlines()
+            self.assertFalse(any(line.startswith("FLUSH") for line in commands))
+            self.assertEqual(commands[-1], "SHUTDOWN committed")
+        finally:
+            for event in cancel:
+                event.set()
+            for worker in workers:
+                worker.join(5)
+
+    def test_close_while_current_thread_holds_control_does_not_self_deadlock(self):
+        self.start(2, more=["--cache-async"])
+        with self.engine.ctl, mock.patch("serve.server.ENGINE_QUIT_WAIT_S", 0.05):
+            self.engine.close()
+        self.assertEqual(self.log.read_text().splitlines(), ["SHUTDOWN committed"])
+        self.assertIsNone(self.engine.proc)
+
+    def test_flush_error_is_reported_after_the_process_is_closed(self):
+        self.start(2, more=["--cache-async", "--flush-error"])
+        with self.assertRaisesRegex(SessionRefused, "pending write failed"):
+            self.engine.close()
+        self.assertIsNone(self.engine.proc)
+        self.assertEqual(self.log.read_text().splitlines(), ["FLUSH", "SHUTDOWN committed"])
+
+    def test_shutdown_error_is_reported_without_consuming_control_replies(self):
+        self.start(2, more=["--cache-async", "--shutdown-error"])
+        with self.engine.ctl:
+            with self.assertRaisesRegex(SessionRefused, "shutdown write failed"):
+                self.engine.close()
+        self.assertIsNone(self.engine.proc)
+
+    def test_missing_shutdown_barrier_is_not_a_successful_drain(self):
+        self.start(0, more=["--cache-async", "--shutdown-early"])
+        with self.engine.ctl:
+            with self.assertRaisesRegex(EngineDied, "before its disk cache shutdown barrier"):
+                self.engine.close()
+        self.assertIsNone(self.engine.proc)
+
+    def test_malformed_shutdown_wait_is_not_treated_as_a_successful_drain(self):
+        self.start(0, more=["--cache-async", "--shutdown-invalid"])
+        process = self.engine.proc
+        with self.engine.ctl:
+            with self.assertRaisesRegex(EngineDied, "invalid session wait"):
+                self.engine.close()
+        self.assertIsNone(self.engine.proc)
+        self.assertNotEqual(process.returncode, 0)
 
 
 if __name__ == "__main__":

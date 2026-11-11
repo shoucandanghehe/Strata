@@ -783,6 +783,10 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=save"    -H "Content-Type: ap
 curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
 ```
 
+DFlash2 saves use a v2 extension for the drafter's private ring, tags, token history, activation log and deferred
+context. The model identity includes its pack and draft vocabulary, and the configuration includes ring-log mode.
+Files without DFlash2 retain the v1 bytes.
+
 - `DIR` becomes an absolute path at start and is created with mode 0700. Files are created with mode 0600 on Linux (on Windows
   they inherit the folder's permissions), nothing deletes them, and they are large (about 1.2 GB per 63K-token conversation).
   Keep `DIR` private to the user that runs Strata.
@@ -807,6 +811,40 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
 - Not supported with `--layer-split`, `--peer-device`, `--batch` or `--prompt-cache 0`. The engine has been run on Linux and CUDA
   only for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
   change later output.
+
+#### Automatic session cache (opt-in)
+
+`--session-cache-dir DIR --session-cache-mib N` enables the native background cache. It is off by default: no cache
+thread or storage access is started. It supports single-session MTP and DFlash2 on one GPU, with `--prompt-cache`
+above zero, no helper expert caches, no parallel slots and no layer split.
+
+`--session-cache-slots N` limits logical conversations (default 8). `--session-cache-idle-seconds N` delays a completed
+conversation's save until it is idle (default 60); `--session-cache-min-tokens N` sets its minimum input length
+(default 4096). Switching or overwriting a conversation, `FLUSH`, and shutdown force eligible pending saves.
+
+The server config can forward these settings to the native engine:
+
+```json
+{
+  "slot_save_path": "sessions",
+  "disk_cache": {"max_mib": 16384, "max_entries": 8, "idle_s": 60, "min_tokens": 4096}
+}
+```
+
+Live sessions, their checkpoints and parked RAM snapshots are checked first. Disk is read only when RAM cannot satisfy
+the request's boundary. Each save owns its captured snapshot until publication completes; the writer never rereads a
+live slot. `FLUSH` waits for queued publication and reports failures. The server also waits for the native shutdown
+barrier and reports write errors rather than treating process exit as a successful save.
+
+Completed 4096-cell main-model K/V chunks are stored once across conversations in a model/configuration namespace.
+Partial tails, indexer data, recurrent state and draft K/V remain private. DFlash2's ring, tags, current lineage
+log and deferred context are also private to each saved conversation; their manifests use the v3 extension.
+Ordinary automatic-cache manifests retain v2. Both check ownership metadata separately from private bytes.
+Pruning counts unique physical bytes and releases chunks only after their last owner is removed.
+An invalid ownership record refuses further writes and reclamation; inference can still read the prompt cold.
+Engine versions have separate identities. Older automatic-cache namespaces and session files without DFlash2
+are unchanged. CPU file/worker tests are enabled with `STRATA_BUILD_CONVERSATION_TESTS`.
+Do not share one cache directory between running engines.
 
 ### The web page (Chat, Images, Monitor, About)
 

@@ -217,6 +217,97 @@ int main() {
         check(session_file_read(p.string(), id, back, read, error) && same(original, back), "buffered read");
         set_env("STRATA_SESSION_BUFFERED", inherited ? kept.c_str() : nullptr);   // the caller's choice again
     }
+    // DFlash2 v2 extension: independent literal bytes, complete arrays, bounded parsing and corruption refusal.
+    {
+        SavedConversation s;
+        Dflash2State d;
+        d.shape = {2560, 1, 32, 8, 128, 7680, 2048, 16, 256, 42, 50000,
+                   2064, 2048, 256, 10000.0f, 0.25f, false, {5, 15, 25, 35, 45}};
+        d.log_enabled = true; d.epoch = 3; d.have_ctx = 3; d.ring_hi = 3;
+        d.ring.assign(4227072, 0.0f); d.ring[0] = 1.0f; d.ring[1] = -2.0f;
+        d.tags.assign(2064, -1); d.tags[0] = int64_t(3) << 32;
+        d.slot_positions = d.tags; d.history = {10, 20, 30};
+        Dflash2LogChunk c;
+        c.q.assign(655360, 0); c.q[0] = -7; c.q.back() = 9;
+        c.scales.assign(20480, 0); c.scales[0] = 1.5f;
+        c.valid.assign(256, 0); c.valid[0] = 1;
+        d.log.push_back(std::move(c));
+        d.deferred_lo = 3; d.deferred_hi = 4;
+        d.deferred.assign(12800, 0); d.deferred[0] = 0.25f; d.deferred.back() = -0.5f;
+        s.dflash2 = d;
+        const fs::path p = dir / "df2.bin";
+        check(session_file_write(p.string(), s, id, written, error), "DFlash2 v2 write");
+        const auto file = slurp(p);
+        check(uint8_t(file[8]) == 2, "DFlash2 presence explicitly selects header version 2");
+
+        // A separate, hand-enumerated wire image: no production serializer or runtime sizing helper supplies it.
+        std::vector<char> expected;
+        auto hex = [&](const char* text) {
+            auto digit = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+            for (; *text; text += 2) expected.push_back(char(digit(text[0]) * 16 + digit(text[1])));
+        };
+        hex("0100000000000000" "000a000000000000" "0100000000000000" "2000000000000000"
+            "0800000000000000" "8000000000000000" "001e000000000000" "0008000000000000"
+            "1000000000000000" "0001000000000000" "2a00000000000000" "50c3000000000000"
+            "1008000000000000" "0008000000000000" "0001000000000000" "00401c460000803e"
+            "0000000000000000" "0500000000000000" "050000000f00000019000000230000002d000000"
+            "0100000000000000" "0300000000000000" "0300000000000000" "0300000000000000"
+            "0300000000000000" "0400000000000000" "0080400000000000");
+        hex("0000803f000000c0"); expected.insert(expected.end(), 16908280, 0);
+        hex("1008000000000000" "0000000003000000"); expected.insert(expected.end(), 16504, char(0xff));
+        hex("1008000000000000" "0000000003000000"); expected.insert(expected.end(), 16504, char(0xff));
+        hex("0300000000000000" "0a000000140000001e000000"
+            "0100000000000000" "0000000000000000" "00000a0000000000");
+        hex("f9"); expected.insert(expected.end(), 655358, 0); hex("09");
+        hex("0050000000000000" "0000c03f"); expected.insert(expected.end(), 81916, 0);
+        hex("0001000000000000" "01"); expected.insert(expected.end(), 255, 0);
+        hex("0032000000000000" "0000803e"); expected.insert(expected.end(), 51192, 0); hex("000000bf");
+        // An empty v1 payload is exactly 248 bytes: geometry/range/cvec, empty live checkpoint and two directories.
+        check(file.size() == 312 + expected.size() + 16 &&
+              std::equal(expected.begin(), expected.end(), file.begin() + 312),
+              "DFlash2 extension equals independent literal wire bytes, including every ring/log/deferred byte");
+        check(session_file_write((dir / "df2-sources.bin").string(), s, std::vector<SessionKvSource>{}, id, written, error) &&
+              slurp(dir / "df2-sources.bin") == file, "streaming K/V source writer emits the same DFlash2 extension");
+        SessionReadLimits limits;
+        limits.max_tokens = 256; limits.max_checkpoints = 0; limits.max_kv_layers = 0;
+        limits.max_state_bytes = {0, 0, 0, 0, 0};
+        limits.dflash2 = Dflash2SnapshotLimits{d.shape, 256, true};
+        check(session_read_max_file_bytes(limits) >= file.size() && session_read_max_file_bytes(limits) < UINT64_MAX,
+              "DFlash2 runtime limits bound the complete file including ring, log and deferred storage");
+        SavedConversation back;
+        size_t read = 0;
+        check(session_file_read(p.string(), id, back, read, error, limits) && back.dflash2 && *back.dflash2 == d,
+              "bounded DFlash2 read preserves the complete CPU state");
+        check(back.bytes() >= d.bytes(), "parked image budget includes DFlash2 state");
+        SessionSaveLive live; live.dflash2_bytes = 123456;
+        check(session_save_peak_bytes(nullptr, live) == session_save_peak_bytes(nullptr, {}) + 123456,
+              "save memory preflight includes the drafter capture");
+        check(session_file_read(p.string(), id, back, read, error), "default payload-bounded v2 reader still works");
+        auto mismatch = limits; --mismatch.dflash2->shape.window;
+        check(rejects(p, id, "shape", mismatch), "DFlash2 geometry mismatch rejected before array parsing");
+        auto too_small = limits; too_small.dflash2->max_tokens = 2;
+        check(rejects(p, id, "counter", too_small), "DFlash2 positions over runtime bounds rejected");
+        auto bad_file = file;
+        // Ring element count, after schema/shape/counters: corrupt it without changing the full file size.
+        const size_t ring_count = 312 + 212;
+        std::fill(bad_file.begin() + ring_count, bad_file.begin() + ring_count + 8, char(0xff));
+        spit(dir / "df2-count.bin", bad_file);
+        check(rejects(dir / "df2-count.bin", id, "count", limits), "DFlash2 oversized ring count rejected before allocation");
+        bad_file = file;
+        const size_t log_index = 312 + 16941576; // after the full ring, both tag arrays, history and log count
+        std::fill(bad_file.begin() + log_index, bad_file.begin() + log_index + 8, char(0xff));
+        spit(dir / "df2-log-index.bin", bad_file);
+        check(rejects(dir / "df2-log-index.bin", id, "index", limits), "DFlash2 sparse log index bounded before chunk allocation");
+        bad_file = file; bad_file[312] = 2;
+        spit(dir / "df2-schema.bin", bad_file);
+        check(rejects(dir / "df2-schema.bin", id, "version", limits), "unknown DFlash2 extension schema rejected");
+        bad_file = file; bad_file[312 + 260] ^= 1;
+        spit(dir / "df2-corrupt.bin", bad_file);
+        check(rejects(dir / "df2-corrupt.bin", id, "checksum", limits), "DFlash2 ring corruption rejected");
+        auto invalid = s; invalid.dflash2->log[0].valid[0] = 2;
+        check(!session_file_write((dir / "df2-invalid.bin").string(), invalid, id, written, error) &&
+              !fs::exists(dir / "df2-invalid.bin"), "invalid DFlash2 state refused before opening a file");
+    }
 
     const std::vector<char> image = slurp(good);
     // truncation at every structural boundary and in the middle
@@ -244,7 +335,7 @@ int main() {
     // wrong version: header field patched and header hash recomputed so only the version differs
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");

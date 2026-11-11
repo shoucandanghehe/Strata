@@ -1,7 +1,7 @@
 // On-disk persistence of a conversation's state (SavedConversation): one file holding the running state, the
 // checkpoints the caller passes (the engine passes only the deepest one), every QSA layer's authoritative K/V and
-// the draft layer's K/V.  Pure host code: no CUDA.  Format v1 and the fail-closed read order are in
-// docs/DETAILS.md (Session files).
+// the draft layer's K/V. Pure host code: no CUDA. Format v1 and the fail-closed read order are in
+// docs/DETAILS.md (Session files). A DFlash2 image selects v2: the unchanged v1 payload plus its versioned CPU state.
 //
 // Format v1 is little-endian, with fixed-width integers and IEEE-754 floats; a big-endian build is refused at
 // compile time.  The hashes detect accidental corruption; they do not authenticate a file: restore trusted files only.
@@ -190,10 +190,11 @@ struct SessionSaveLive {
     uint64_t state_bytes = 0;   // the live running state (gdn + ple + every owned QSA layer's tail, dead, block_pos)
     uint64_t tokens = 0, images = 0;
     uint64_t kv_layers = 0;     // K/V sources (owned QSA layers + the draft)
+    uint64_t dflash2_bytes = 0; // the selected drafter's CPU snapshot (snapshot_bytes), before capture
 };
 // The peak, with saturating arithmetic: two copies of the deepest checkpoint (the list handed to the capture and the
-// one inside the captured image), the copied live state with its token and image lists, the K/V source directory,
-// the 16 MiB write buffer and 1 MiB for the small vectors.
+// one inside the captured image), the copied live state with its token and image lists, the optional DFlash2 capture,
+// the K/V source directory, the 16 MiB write buffer and 1 MiB for the small vectors.
 uint64_t session_save_peak_bytes(const ConversationCheckpoint* deepest, const SessionSaveLive& live);
 // The SAVE's RAM PREFLIGHT, BEFORE anything is copied: `admit` is asked for session_save_peak_bytes; only when it
 // agrees is the deepest checkpoint copied into `out`.  On a refusal nothing was allocated, `out` is empty, `chain`
@@ -218,12 +219,15 @@ struct SessionReadLimits {
     // per K/V layer (the QSA layers, then the draft): the most bytes of each part (k, v, k_scale, v_scale, pooled).
     // A layer past the end of the list is bounded by the payload only.
     std::vector<std::array<uint64_t, 5>> max_kv_bytes;
+    // Absent: bounded by the payload and the implementation's actual shape bounds; present: exact runtime shape,
+    // log mode and position limit, checked before allocating the DFlash arrays.
+    std::optional<Dflash2SnapshotLimits> dflash2;
     // the RAM PREFLIGHT: asked once the header and identity match and before any payload allocation, with what the
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
 };
-// The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
+// The largest v1 file (also v2 when dflash2 limits are supplied); open limits return max_file_bytes.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
 // What the RAM preflight is asked for a file of `file_bytes`: the parsed image (about the payload), the 16 MiB read
 // buffer, and the per-allocation overhead of its arrays (a page per 16 MiB segment plus the small vectors).

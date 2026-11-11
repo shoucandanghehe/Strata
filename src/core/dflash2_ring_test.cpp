@@ -12,6 +12,7 @@
 //   5 evicted    : a stash too small to keep A: the resume is cold (missing rows reported, *cold set)
 // Exit 0 when every assertion holds.
 #include "strata/core/dflash2.hpp"
+#include "strata/core/conversation_file.hpp"
 
 #include <cuda_runtime.h>
 
@@ -21,6 +22,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <chrono>
+#include <filesystem>
 #include <vector>
 
 using strata::core::Dflash2Drafter;
@@ -184,6 +187,101 @@ int main(int argc, char** argv) {
         check(d.ring_stats.stash_hits >= 1, "the old branch was kept (copy on write) and came back");
         check(bad == 0, "the old branch's rows are bitwise the original update's, not the new branch's");
         check(!cold, "not cold");
+    }
+    {   // Persistence: capture, replace the live owner, file round trip, restore, deferred replay, rewind.
+        std::printf("4 persistence (complete current state, deferred taps, later rewind)\n");
+        Dflash2Drafter d;
+        if (!fresh(d)) return 2;
+        if (!feed(d, dev, 1, 0, P + 599, err)) return 2;
+        std::vector<float> last_taps(kTap);
+        for (int i = 0; i < kTap; ++i) last_taps[(size_t) i] = tap_value(1, P + 599, i);
+        if (cudaMemcpy(dev, last_taps.data(), kTap * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+            !d.context_async(dev, 1, P + 599, err)) return 2;
+        const int32_t last_token = token_of(1, P + 599);
+        d.note_rows(&last_token, 1, P + 599);
+        constexpr int deferred_rows = 3;
+        const int64_t deferred_from = P + 600;
+        float* held = d.defer_rows(deferred_from, deferred_rows, err);
+        if (!held) return 2;
+        // This run does not wrap the pinned ring. Fill real taps just as a slot's verifier copy would.
+        for (int r = 0; r < deferred_rows; ++r)
+            for (int i = 0; i < kTap; ++i) held[(size_t) r * kTap + i] = tap_value(1, deferred_from + r, i);
+        const auto tokens = ids_of(1, deferred_from + deferred_rows);
+        d.note_rows(tokens.data() + deferred_from, deferred_rows, deferred_from);
+        strata::core::Dflash2State captured;
+        const size_t capture_peak = d.snapshot_bytes();
+        check(d.snapshot(captured, err), "snapshot synchronizes pending context, ring, tags, lineage and deferred taps");
+        check(captured.bytes() <= capture_peak, "pre-capture memory estimate covers the owned snapshot");
+        check(captured.history == tokens && captured.deferred.size() == (size_t) deferred_rows * kTap,
+              "snapshot contains the complete history and exactly the held rows");
+        d.reset(); d.clear_deferred();
+        if (!feed(d, dev, 2, 0, 3000, err)) return 2;
+
+        const auto path = std::filesystem::temp_directory_path() / ("strata-df2-state-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+        strata::core::SavedConversation saved;
+        saved.live.ids = captured.history;
+        saved.dflash2 = captured;
+        const strata::core::SessionFileIdentity identity{123, 456};
+        size_t bytes = 0;
+        if (!strata::core::session_file_write(path.string(), saved, identity, bytes, err)) {
+            std::printf("write: %s\n", err.c_str()); return 2;
+        }
+        saved = {}; // Drop every file-image copy before the read.
+        strata::core::SessionReadLimits limits;
+        limits.max_tokens = 8192;
+        limits.dflash2 = d.snapshot_limits(8192);
+        if (!strata::core::session_file_read(path.string(), identity, saved, bytes, err)) {
+            std::printf("read: %s\n", err.c_str()); return 2;
+        }
+        std::filesystem::remove(path);
+        check(saved.dflash2 && *saved.dflash2 == captured, "v2 preserves every persisted DFlash state byte");
+        {
+            Dflash2Drafter empty;
+            if (!empty.clone_alloc(d, err)) return 2;
+            check(empty.restore_bytes(captured) == d.restore_bytes(captured) + (size_t) 2048 * kTap * sizeof(float),
+                  "restore preflight includes the full deferred allocation only for an owner without it");
+            if (!empty.restore(*saved.dflash2, err)) return 2;
+            strata::core::Dflash2State first_restore;
+            check(empty.snapshot(first_restore, err) && first_restore == captured,
+                  "restore on a fresh owner allocates deferred storage and restores all state independently");
+        }
+        const float* landing = d.landing();
+        if (!d.restore(*saved.dflash2, err)) { std::printf("restore: %s\n", err.c_str()); return 2; }
+        strata::core::Dflash2State restored;
+        check(d.snapshot(restored, err) && restored == captured, "restored GPU ring, tags and host state equal capture");
+        check(d.landing() == landing && d.ring_stash_bytes() == 0, "restore keeps graph buffers and imports no other lineage");
+        check(d.has_deferred() && d.deferred_hi() == deferred_from + deferred_rows &&
+              std::memcmp(d.deferred_row(deferred_from), captured.deferred.data(), kTap * sizeof(float)) == 0,
+              "deferred taps retain positions and exact row bytes");
+
+        // Rejected geometry must not write any GPU or host state.
+        auto malformed = restored;
+        --malformed.shape.ring_slots;
+        check(!d.restore(malformed, err) && !err.empty(), "invalid geometry restore is visibly rejected");
+        strata::core::Dflash2State unchanged;
+        check(d.snapshot(unchanged, err) && unchanged == restored, "rejected restore leaves the owner unchanged");
+        if (!d.catch_up(deferred_from + deferred_rows, err)) return 2;
+        check(!d.has_deferred(), "restored deferred rows replay and retire normally");
+        std::vector<float> replayed;
+        std::vector<int64_t> replayed_tags;
+        if (!d.debug_ring(replayed, replayed_tags, err)) return 2;
+        d.reset(); d.clear_deferred();
+        if (!feed(d, dev, 1, 0, deferred_from + deferred_rows, err)) return 2;
+        std::vector<float> uninterrupted;
+        std::vector<int64_t> uninterrupted_tags;
+        if (!d.debug_ring(uninterrupted, uninterrupted_tags, err)) return 2;
+        check(replayed.size() == uninterrupted.size() &&
+              std::memcmp(replayed.data(), uninterrupted.data(), replayed.size() * sizeof(float)) == 0,
+              "restored deferred replay gives the uninterrupted context's complete K/V bytes");
+        if (!d.restore(captured, err)) return 2;
+        const auto ids = ids_of(1, N);
+        bool cold = true;
+        check(d.begin_request(ids.data(), N, P, &cold), "restored lineage can begin a rewound request");
+        int wt = 0;
+        check(count_bad(d, ref, N - 2047, P, &wt) == 0 && !cold && d.last_rebuilt > 0,
+              "rewind after restore rebuilds overwritten rows from the persisted log, bitwise the original");
+        if (!feed(d, dev, 1, P, N, err)) return 2;
     }
     {   // ---- 5 evicted
         std::printf("5 evicted (stash budget 0)\n");

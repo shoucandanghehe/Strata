@@ -18,6 +18,7 @@
 #include <cstdlib>
 
 #include "strata/core/session.hpp"
+#include "strata/core/dflash2_state.hpp"
 
 #include <cuda_runtime.h>
 
@@ -67,8 +68,17 @@ public:
     /// its ring, buffers, streams and graphs (about 100 MiB): `clone_alloc` after the parent's `load`, `clone_bind` after its `bind`, then `set_max_drafts` and `prepare` as for the parent.
     bool clone_alloc(const Dflash2Drafter& parent, std::string& err);   ///< after the parent's load: streams and buffers (before the expert cache is sized)
     bool clone_bind(const Dflash2Drafter& parent, std::string& err);    ///< after the parent's bind: the shared head, embedding and the draft logits
-    /// Copy another drafter's context (ring, tags, token history, epoch) exactly: a request that moves between the solo session and a batch slot.  Same card.
+    /// Copy another drafter's current context (device ring/tags, host history/log, epoch and deferred taps) exactly. Same card.
     bool copy_state_from(Dflash2Drafter& src, std::string& err);
+    /// CPU-owned persistence of this conversation only. Capture finishes queued work and clears stale rows only in
+    /// the CPU export. Restore validates before device writes and keeps graph buffer addresses. Finish launched drafts first.
+    bool snapshot(Dflash2State& out, std::string& err);
+    bool validate_snapshot(const Dflash2State& state, std::string& err) const;
+    bool restore(const Dflash2State& state, std::string& err);
+    size_t snapshot_bytes() const;
+    /// Additional host allocations during restore of a validated state, excluding the image already held.
+    size_t restore_bytes(const Dflash2State& state) const;
+    Dflash2SnapshotLimits snapshot_limits(uint64_t max_tokens) const;
     /// A fixed device buffer [kRows][taps][n_embd] on this drafter's card: where a layer split's stages land their taps (Verifier::gather_taps) and the
     /// graphs are captured on it.  Allocated at load.
     float* landing() const { return landing_; }
@@ -257,7 +267,7 @@ private:
     float* h_logd_ = nullptr;       ///< ... and scales [8][80], filled by the update's graph
     int64_t pend_pos0_ = -1;        ///< positions the update in flight will leave in h_log*
     int pend_n_ = 0;
-    int64_t slot_pos_[kRing] = {};  ///< host shadow of the device ring tags: (epoch << 32 | position) of the row each slot holds, -1 none
+    int64_t slot_pos_[kRing] = {};  ///< current-lineage ownership: epoch/position, -1 when the live device slot is stale (also with logging off)
     uint8_t* rb_q_ = nullptr;       ///< rebuild scratch (device): the window's codes, scales and positions
     float* rb_d_ = nullptr;
     int32_t* rb_pos_ = nullptr;

@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import (ByteTokenizer, Service, StrataEngine, serve, slot_filename_problem,  # noqa: E402
-                          slot_save_dir)
+                          slot_save_dir, engine_args, EngineDied, SessionRefused)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -443,6 +443,74 @@ class Slots(unittest.TestCase):
         self.svc.fifo.release()
         t.join(10)
         self.assertEqual(out["r"][0], 200)
+
+
+    def test_flush_uses_session_protocol_and_exposes_writer_errors(self):
+        self.engine.silence_s = 0.1
+        self.engine.script = ["SWAIT flush 1\n", 0.3, "FLUSHED 0 0 300.0\n"]
+        self.assertEqual(self.engine.session_file("flush", ""), {"tokens": 0, "bytes": 0, "ms": 300.0})
+        self.assertEqual(self.engine.proc.sent, ["FLUSH\n"])
+        for script, exception in ((["SERR io 0 writer failed\n"], SessionRefused), ([None], EngineDied),
+                                  (["SAVED 0 0 0\n"], EngineDied), (["SWAIT flush 3601\n"], EngineDied)):
+            self.fresh_engine()
+            self.engine.script = script
+            with self.subTest(script=script), self.assertRaises(exception):
+                self.engine.session_file("flush", "")
+
+    def test_flush_preserves_disabled_silence_limit_after_announced_wait(self):
+        self.engine.silence_s = 0
+        self.engine.script = ["SWAIT flush 1\n", 1.1, "FLUSHED 0 0 1100.0\n"]
+        self.assertEqual(self.engine.session_file("flush", ""), {"tokens": 0, "bytes": 0, "ms": 1100.0})
+        self.assertFalse(self.engine.proc.killed)
+
+
+class DiskCacheArgs(unittest.TestCase):
+    def test_native_settings_preserve_explicit_features_and_legacy_files(self):
+        with tempfile.TemporaryDirectory() as base:
+            directory = Path(base, "sessions")
+            directory.mkdir()
+            index = directory / "index.json"
+            index.write_text("legacy index must not be opened or pruned")
+            old = directory / "auto-legacy.bin"
+            old.write_bytes(b"legacy")
+            args = ["--unified-slots", "--prompt-cache", "6"]
+            cfg = {"args": args, "cwd": base, "parallel": 2, "slot_save_path": "sessions",
+                   "disk_cache": {"max_mib": 16384, "max_entries": 8, "idle_s": 0.5, "min_tokens": 4096}}
+            self.assertEqual(engine_args(cfg), args + ["--batch", "2", "--session-cache-mib", "16384",
+                             "--session-cache-slots", "8", "--session-cache-idle-seconds", "0.5",
+                             "--session-cache-min-tokens", "4096", "--session-cache-dir", str(directory)])
+            self.assertEqual(old.read_bytes(), b"legacy")
+            self.assertEqual(index.read_text(), "legacy index must not be opened or pruned")
+            cfg["user_args"] = ["--session-cache-mib", "32"]
+            got = engine_args(cfg)
+            self.assertEqual(got.count("--session-cache-mib"), 1)
+            self.assertEqual(got[got.index("--session-cache-mib") + 1], "32")
+            cfg.pop("user_args")
+            cfg["disk_cache"] = False
+            self.assertEqual(engine_args(cfg), args + ["--batch", "2"])
+            self.assertEqual(cfg["args"], args)
+
+    def test_cache_does_not_enable_fixed_slots_or_touch_storage_when_off(self):
+        with tempfile.TemporaryDirectory() as base:
+            cfg = {"args": [], "cwd": base, "parallel": 2, "slot_save_path": "sessions"}
+            self.assertEqual(engine_args(cfg), ["--batch", "2"])
+            self.assertFalse(Path(base, "sessions").exists())
+            cfg["disk_cache"] = {"max_mib": 16, "max_entries": 8, "idle_s": 60, "min_tokens": 4096}
+            self.assertNotIn("--unified-slots", engine_args(cfg))
+
+    def test_invalid_native_settings_do_not_create_a_cache(self):
+        good = {"max_mib": 16, "max_entries": 8, "idle_s": 60, "min_tokens": 4096}
+        with tempfile.TemporaryDirectory() as base:
+            for key, value in (("max_mib", True), ("max_entries", -1), ("min_tokens", "10"),
+                               ("idle_s", float("inf")), ("idle_s", -0.1)):
+                with self.subTest(key=key, value=value):
+                    cfg = {"args": [], "cwd": base, "slot_save_path": "sessions",
+                           "disk_cache": dict(good, **{key: value})}
+                    with self.assertRaises(ValueError):
+                        engine_args(cfg)
+            self.assertFalse(Path(base, "sessions").exists())
+            with self.assertRaisesRegex(ValueError, "slot_save_path"):
+                engine_args({"args": [], "disk_cache": good})
 
 
 if __name__ == "__main__":

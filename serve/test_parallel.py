@@ -45,6 +45,8 @@ def reader():
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
+if "--cache-async" in args:
+    print("INFO session_cache_async=1", flush=True)
 if "--fake-stage-plan" in args:
     print("strata serve: layer split: layers 0-11 (CUDA0), 12-23 (CUDA1), 24-35 (CUDA2), "
           "36-47 (CUDA3), one hand-off per window", file=sys.stderr, flush=True)
@@ -102,7 +104,28 @@ while True:
     except queue.Empty:
         line = ""
     if line is None or line == "QUIT":
+        if "--cache-async" in args:
+            if "--shutdown-early" in args:
+                sys.exit(1)
+            print("SWAIT shutdown 3601" if "--shutdown-invalid" in args else "SWAIT shutdown 1", flush=True)
+            time.sleep(0.25)
+            if "--shutdown-error" in args:
+                print("SERR io 0 shutdown write failed", flush=True)
+            elif log:
+                log.write("SHUTDOWN committed\n"); log.flush()
         break
+    if line == "FLUSH":
+        if log:
+            log.write("FLUSH\n"); log.flush()
+        print("SWAIT flush 1", flush=True)
+        time.sleep(0.2)
+        if "--flush-error" in args:
+            print("SERR io 0 pending write failed", flush=True)
+        else:
+            if log:
+                log.write("FLUSH committed\n"); log.flush()
+            print("FLUSHED 0 0 200.0", flush=True)
+        continue
     if line.startswith("BYIELD "):
         continue                              # too late: the read it was for has ended
     if line.startswith("BSTOP "):

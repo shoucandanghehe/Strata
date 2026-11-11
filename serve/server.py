@@ -1118,6 +1118,7 @@ class StrataEngine:
     _last_done = _RequestOwned()
     _ctl_erred = _RequestOwned(False)
     _ctl_held = _RequestOwned(False)     # this thread already holds the control lines (Service.vram takes them itself)
+    _shutdown_lines: queue.Queue[str | None] | None = None
     CONTROL_WAIT_S = 300.0               # how long vram() / session_file() wait for the control lines of a batch engine
     DRAIN_TIMEOUT_S = 300.0              # how long an interrupted request waits, with no line from its engine, for DONE / BADM
     QUARANTINE_S = 600.0                 # ... and how long a slot or the control lines stay held after that with no line
@@ -1150,6 +1151,7 @@ class StrataEngine:
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         # the all-cards split engine (sFNX, strata-split-N[-arch]): its GEN parser accepts fewer keys than Strata's engine (tests/split/test_split_gen_keys.py pins them)
         self.split_engine = os.path.basename(str(exe)).startswith("strata-split")
+        self._shutdown_lines = None
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -1396,6 +1398,9 @@ class StrataEngine:
         multi = self.multi
         line = None
         for line in proc.stdout:
+            shutdown = self._shutdown_lines if self.proc is proc else None
+            if shutdown is not None and line.startswith(("SWAIT ", "SERR ")):
+                shutdown.put(line)
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -1443,6 +1448,8 @@ class StrataEngine:
                 except (IndexError, ValueError):
                     pass
             lines.put(line)
+        if self.proc is proc and self._shutdown_lines is not None:
+            self._shutdown_lines.put(None)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
             if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
@@ -2996,7 +3003,7 @@ class StrataEngine:
             return self._session_file(action, path)
 
     def _session_file(self, action: str, path: str) -> dict:
-        """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
+        """Disk sessions: `SAVE <path>` / `RESTORE <path>` or `FLUSH` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
         malformed one, a bare ERR, an answer with negative counts or a non-finite time - means the two sides lost
@@ -3007,16 +3014,16 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
-        if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
+        if action not in ("save", "restore", "flush") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write("FLUSH\n" if action == "flush" else f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
+        want = {"save": "SAVED", "restore": "RESTORED", "flush": "FLUSHED"}[action]
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -3094,22 +3101,82 @@ class StrataEngine:
                 continue
             raise out_of_step(line)
 
+    @staticmethod
+    def _session_wait(fields: list[str]) -> int:
+        if len(fields) != 3 or not fields[1].isalpha() or not fields[1].isascii() or not fields[2].isdigit():
+            raise ValueError("invalid session wait")
+        seconds = int(fields[2])
+        if not 0 < seconds <= SESSION_WAIT_MAX_S:
+            raise ValueError("invalid session wait")
+        return seconds
+
     def close(self):
         """End the engine process: STOP + QUIT first (the engine frees its memory itself - unpinning tens of GB can take
         a while; ENGINE_QUIT_WAIT_S), then terminate (ENGINE_TERM_WAIT_S), then kill (ENGINE_KILL_WAIT_S).  Raises
         EngineStuck when it still runs after all three."""
         if self.proc is None:
             return
+        cache_async = self.info.get("session_cache_async") == 1
+        cache_error = None
         try:
             if self.proc.poll() is None:
                 try:
-                    # STOP first: a request still running ends at its next step instead of being waited for (the
-                    # engine reads stdin on its own thread; QUIT behind a long answer would sit in its queue)
-                    self.proc.stdin.write("STOP\nQUIT\n")
-                    self.proc.stdin.flush()
-                    self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S)
-                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    if cache_async:
+                        self.ended = True              # no new consumer may take the process being closed
+                        self._send("STOP")
+                        # Serial GEN owns the control replies through the service FIFO, not ctl.
+                        # Its shutdown barrier is observed without consuming that request's DONE.
+                        if self.batch and self.ctl.acquire(blocking=False):
+                            try:
+                                try:
+                                    self._session_file("flush", "")
+                                except (SessionRefused, EngineDied) as e:
+                                    cache_error = e
+                            finally:
+                                self.ctl.release()
+                        self._shutdown_lines = queue.Queue()
+                    if cache_async:
+                        with self.wlock:
+                            self.proc.stdin.write("QUIT\n")
+                            self.proc.stdin.flush()
+                            self.proc.stdin.close()
+                    else:
+                        self.proc.stdin.write("STOP\nQUIT\n")
+                        self.proc.stdin.flush()
+                        self.proc.stdin.close()        # Windows' detached reader needs EOF before shutdown
+                    wait = ENGINE_QUIT_WAIT_S
+                    if cache_async:
+                        deadline = time.monotonic() + wait
+                        shutdown = False
+                        while True:
+                            left = deadline - time.monotonic()
+                            try:
+                                line = self._shutdown_lines.get(timeout=max(0, left))
+                            except queue.Empty:
+                                raise subprocess.TimeoutExpired("engine shutdown", wait) from None
+                            if line is None:
+                                break
+                            fields = line.split()
+                            if fields[0] == "SWAIT":
+                                seconds = self._session_wait(fields)
+                                if fields[1] == "shutdown":
+                                    shutdown = True
+                                wait = max(ENGINE_QUIT_WAIT_S, seconds)
+                                deadline = time.monotonic() + wait
+                            elif shutdown:
+                                parts = line.rstrip("\r\n").split(" ", 3)
+                                if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
+                                    raise ValueError("invalid shutdown session error")
+                                cache_error = SessionRefused(parts[1], parts[3], parts[2] == "1")
+                        if not shutdown and cache_error is None:
+                            cache_error = EngineDied("the engine ended before its disk cache shutdown barrier")
+                        wait = max(0, deadline - time.monotonic())
+                    code = self.proc.wait(timeout=wait)
+                    if cache_async and code != 0 and cache_error is None:
+                        cache_error = EngineDied(f"the engine failed during disk cache shutdown (exit code {code})")
+                except (EngineDied, OSError, ValueError, subprocess.TimeoutExpired) as e:
+                    if cache_async and cache_error is None:
+                        cache_error = EngineDied(f"the native disk cache did not finish closing: {e}")
                     self.proc.terminate()
                     self.proc.wait(timeout=ENGINE_TERM_WAIT_S)
         except subprocess.TimeoutExpired:
@@ -3135,6 +3202,8 @@ class StrataEngine:
                 self.ended = True
                 self.progress, self.last = None, {}
                 self.progress_ms, self.reused = 0, 0
+        if cache_error is not None:
+            raise cache_error
 
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
@@ -3856,6 +3925,22 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
+    dc = cfg.get("disk_cache")
+    if dc:
+        if not isinstance(dc, dict) or not cfg.get("slot_save_path"):
+            raise ValueError("disk_cache needs its settings and slot_save_path")
+        for key, flag in (("max_mib", "--session-cache-mib"), ("max_entries", "--session-cache-slots"),
+                          ("idle_s", "--session-cache-idle-seconds"), ("min_tokens", "--session-cache-min-tokens")):
+            value = dc.get(key)
+            if key == "idle_s":
+                if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise ValueError("disk_cache.idle_s must be finite nonnegative seconds")
+            elif type(value) is not int or value < 0:
+                raise ValueError(f"disk_cache.{key} must be a nonnegative whole number")
+            if flag not in args:
+                args += [flag, str(value)]
+        if "--session-cache-dir" not in args:
+            args += ["--session-cache-dir", slot_save_dir(cfg["slot_save_path"], cfg.get("cwd"))]
     return learned_profile_args(cfg, args)
 
 
@@ -9974,6 +10059,13 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     config_bytes = Path(a.config).read_bytes() if a.config else b""
     cfg = parse_config_text(config_bytes.decode("utf-8-sig"), a.config) if a.config else {}   # Notepad adds a BOM
     split_joined_args(cfg)
+    if cfg.get("disk_cache") and a.engine != "strata":
+        ap.error("disk_cache needs the native engine")
+    if a.slot_save_path and cfg.get("disk_cache"):
+        try:
+            cfg["slot_save_path"] = slot_save_dir(a.slot_save_path)
+        except (ValueError, OSError) as e:
+            ap.error(str(e))
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
@@ -10170,6 +10262,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         except split_mod.SplitConfigError as e:
             raise SystemExit(f"[strata] config {e}")
         if groups:
+            if cfg.get("disk_cache"):
+                raise SystemExit("[strata] disk_cache is not available with replicas")
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
         elif split:
             engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
