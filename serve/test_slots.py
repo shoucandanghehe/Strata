@@ -634,6 +634,97 @@ class ConcurrentSlots(FakeEngineCase):
             self.engine.proc, self.engine.lines = old_proc, old_lines
             self.engine.slot_busy, self.engine.slot_claims, self.engine.slot_held = old_busy, old_claims, old_held
 
+    def test_new_process_cannot_take_slot_files_before_its_queues_and_tables_are_ready(self):
+        old_proc, old_lines = self.engine.proc, self.engine.lines
+        old_busy, old_claims = self.engine.slot_busy, self.engine.slot_claims
+        paused, resume = threading.Event(), threading.Event()
+        failures = []
+        def restart():
+            try:
+                self.engine.restart(tries=1)
+            except Exception as e:
+                failures.append(e)
+        worker = threading.Thread(target=restart)
+        real_queue = queue.Queue
+        made = 0
+        def make_queue(*args, **kwargs):
+            nonlocal made
+            if threading.current_thread() is worker:
+                made += 1
+                if made == 2:                            # ready_q exists; self.lines and slot tables are still old
+                    paused.set()
+                    if not resume.wait(5):
+                        raise RuntimeError("start publication barrier was not released")
+            return real_queue(*args, **kwargs)
+        from serve import server
+        real_popen = server.subprocess.Popen
+        script = Path(self.tmp.name, "fake_strata.py")
+        with mock.patch("serve.server.queue.Queue", side_effect=make_queue), \
+                mock.patch("serve.server.subprocess.Popen",
+                           lambda cmd, **kw: real_popen([sys.executable, str(script), *cmd[1:]], **kw)):
+            worker.start()
+            try:
+                self.assertTrue(paused.wait(5))
+                successor = self.engine.proc
+                self.assertIsNot(successor, old_proc)
+                self.assertIs(self.engine.lines, old_lines)
+                self.assertIs(self.engine.slot_busy, old_busy)
+                with mock.patch.object(successor.stdin, "write", wraps=successor.stdin.write) as writes:
+                    self.assertEqual(self.post_slot(0, "save", "not-ready.bin")[0], 503)
+                    writes.assert_not_called()
+                    with self.assertRaises(EngineDied):
+                        self.engine.session_file("save", str(Path(self.tmp.name, "sdk-not-ready.bin")), slot=1)
+                    writes.assert_not_called()
+                self.assertEqual(old_busy, [False, False])
+                self.assertEqual(old_claims, set())
+            finally:
+                resume.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertTrue(self.engine.alive())
+        self.assertIsNot(self.engine.lines, old_lines)
+        self.assertIsNot(self.engine.slot_busy, old_busy)
+        self.assertEqual(self.post_slot(0, "save", "ready.bin")[0], 200)
+        self.assertEqual(self.post_slot(1, "save", "next.bin")[0], 200)
+        self.assertEqual(self.commands(), [f"BSAVE 0 {Path(self.tmp.name, 'ready.bin')}",
+                                           f"BSAVE 1 {Path(self.tmp.name, 'next.bin')}"])
+
+    def test_unload_decision_rejects_new_claims_without_holding_slot_condition_during_close(self):
+        closing, resume = threading.Event(), threading.Event()
+        result = {}
+        unload = self.engine.unload
+        def paused_unload():
+            closing.set()                               # Service finished checking slots, but close has not begun
+            if not resume.wait(5):
+                raise RuntimeError("unload barrier was not released")
+            unload()
+        def request_unload():
+            req = urllib.request.Request(self.base + "/unload", data=b"{}",
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                result["response"] = response.status, json.load(response)
+        worker = threading.Thread(target=request_unload)
+        with mock.patch.object(self.engine, "unload", side_effect=paused_unload):
+            worker.start()
+            try:
+                self.assertTrue(closing.wait(5))
+                acquired = self.engine.slot_cv.acquire(blocking=False)
+                self.assertTrue(acquired, "close must not hold slot_cv while waiting for I/O")
+                if acquired:
+                    self.engine.slot_cv.release()
+                self.assertEqual(self.post_slot(0, "save", "too-late.bin")[0], 503)
+                self.assertEqual(self.engine.slot_claims, set())
+                self.assertEqual(self.engine.slot_busy, [False, False])
+                self.assertEqual(self.commands(), [])
+            finally:
+                resume.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result["response"], (200, {"status": "unloaded"}))
+        self.assertIsNone(self.engine.proc)
+        self.assertFalse(Path(self.tmp.name, "too-late.bin").exists())
+
     def test_grouped_slots_and_missing_capability_keep_existing_refusal(self):
         self.engine.slot_groups = 2
         self.assertEqual(self.post_slot(0, "save", "group.bin")[0], 501)

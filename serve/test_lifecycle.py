@@ -363,7 +363,7 @@ class CacheShutdown(FakeEngineCase):
         self.assertIsNone(self.engine.proc)
 
     def test_unload_reports_flush_error_after_the_process_is_closed(self):
-        self.start(2, more=["--cache-async", "--flush-error"])
+        self.start(2, more=["--cache-async", "--batch-session-files", "--flush-error"])
         req = urllib.request.Request(self.base + "/unload", data=b"{}",
                                      headers={"Content-Type": "application/json"})
         with self.assertRaises(urllib.error.HTTPError) as response:

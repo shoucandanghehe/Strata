@@ -1148,6 +1148,10 @@ class StrataEngine:
         # retry_args: the arguments to start again with, once, when this start ends before the engine is ready (an Auto start that picked DFlash2: mtp_retry_args)
         # retry_vram_args: the same start with no drafter (nodraft_retry_args), used instead when the engine ended because a card ran out of memory: swapping DFlash2 for
         # the MTP takes MORE memory from a card that is already short, so that direction is never taken then
+        # Revoke READY before replacing process-owned queues/tables. Slot claims take this same condition.
+        if "slot_cv" in self.__dict__:
+            with self.slot_cv:
+                self.ended = True
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         # the all-cards split engine (sFNX, strata-split-N[-arch]): its GEN parser accepts fewer keys than Strata's engine (tests/split/test_split_gen_keys.py pins them)
         self.split_engine = os.path.basename(str(exe)).startswith("strata-split")
@@ -1324,10 +1328,8 @@ class StrataEngine:
             self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
         except Exception:                               # noqa: BLE001 - a note must never stop a start
             pass
-        self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
-        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own); first, so
-        #                                                 a request that sees the new number sees the new queues (#4451)
+        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own, #4451)
         self.lines: queue.Queue = queue.Queue()
         # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
@@ -1388,7 +1390,9 @@ class StrataEngine:
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
-        self.pump.start()
+        with self.slot_cv:
+            self.ended = False                          # READY only after this process's queues/tables exist
+            self.pump.start()
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
@@ -3023,15 +3027,21 @@ class StrataEngine:
         if action not in ("save", "restore", "flush") or any(c in path for c in "\r\n\0") or \
                 (slot is not None and (action == "flush" or type(slot) is not int or not 0 <= slot < self.batch)):
             raise ValueError("invalid session command")
-        proc, lines = self.proc, self.lines
+        if slot is None:
+            proc, lines = self.proc, self.lines
+        else:
+            with self.slot_cv:
+                if not self.alive():
+                    raise EngineDied("the engine is not ready for a session command")
+                proc, lines = self.proc, self.lines
         if expected_proc is not None and proc is not expected_proc:
             raise EngineDied("the engine restarted before the session command was sent")
         command = "FLUSH" if action == "flush" else (
             f"B{action.upper()} {slot} {path}" if slot is not None else f"{action.upper()} {path}")
         try:
             with self.wlock:
-                if self.proc is not proc:
-                    raise EngineDied("the engine restarted before the session command was sent")
+                if self.proc is not proc or (slot is not None and not self.alive()):
+                    raise EngineDied("the engine restarted or stopped before the session command was sent")
                 proc.stdin.write(command + "\n")
                 proc.stdin.flush()
         except (OSError, AttributeError):
@@ -5098,6 +5108,8 @@ class Service:
                 if batch:
                     engine = self.engine
                     with engine.slot_cv:
+                        if not engine.alive():
+                            return error(503, "the model is not loaded")
                         busy, claims, held = engine.slot_busy, engine.slot_claims, engine.slot_held
                         proc = engine.proc
                         if busy[slot_id] or slot_id in claims or slot_id in engine.slot_releasing:
@@ -5586,12 +5598,13 @@ class Service:
             with self.status_lock:
                 if self.status.get("busy") or self.status.get("queued"):
                     return "busy"
+            if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
+                return "busy"
             if getattr(self.engine, "batch", 0) and (getattr(self.engine, "info", {}) or {}).get("session_slots"):
                 with self.engine.slot_cv:
                     if any(self.engine.slot_busy) or self.engine.slot_claims:
                         return "busy"                    # includes slot files, which do not hold the FIFO
-            if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
-                return "busy"
+                    self.engine.ended = True             # reject new claims before close does any I/O, outside slot_cv
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()

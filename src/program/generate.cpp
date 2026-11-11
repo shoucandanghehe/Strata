@@ -15146,7 +15146,7 @@ int main(int argc, char** argv) {
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && (!sl.img || unified_slots) && !sl.tainted;
-                        sl.file_valid = slot_session_files && !sl.tainted;
+                        sl.file_valid = slot_session_files && !unified_slots && !sl.tainted;
                         break;
                     }
                     sl.x = y;
@@ -16392,7 +16392,7 @@ int main(int argc, char** argv) {
                     if (file_slot >= 0) {
                         BSlot& sl = bs[(size_t) file_slot];
                         sl.cached = unified_slots || live_imgs.empty();
-                        sl.file_valid = true;
+                        sl.file_valid = !unified_slots;
                         sl.img = !live_imgs.empty();
                         sl.partial = sl.partial_from0 = sl.tainted = false;
                         sl.partial_plan = {};
