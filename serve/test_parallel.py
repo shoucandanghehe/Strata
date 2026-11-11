@@ -44,7 +44,9 @@ def reader():
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
-      (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
+      (" slot_cache=1" if "--slotcache" in args else "") +
+      (" unified_slots=1" if "--unified-slots" in args else "") +
+      (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
 if "--cache-async" in args:
     print("INFO session_cache_async=1", flush=True)
 if "--fake-stage-plan" in args:
