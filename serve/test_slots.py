@@ -1,4 +1,4 @@
-"""serve/test_slots.py - llama-server compatible /slots/0?action=save|restore over the engine's SAVE/RESTORE lines
+"""serve/test_slots.py - llama-server compatible /slots/{id}?action=save|restore over native session-file commands
 (mock engine: no GPU, no pack).
 
     python -m unittest serve.test_slots -v
@@ -16,11 +16,14 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import (ByteTokenizer, Service, StrataEngine, serve, slot_filename_problem,  # noqa: E402
                           slot_save_dir, engine_args, EngineDied, SessionRefused)
+from serve.test_parallel import FakeEngineCase  # noqa: E402
+from serve.test_stream_ownership import wait_until  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,6 +40,7 @@ class FakeProc:
         self.sent.append(s)
         cmd, _, path = s.strip().partition(" ")
         script = self.engine.script
+        lines = self.engine.lines
         if script is not None:                      # a scripted answer: a list of lines, None = the process ends
             # played by its own thread, like the real engine's output: write() returns at once, so the server's
             # wait (and its deadline) is already running when a delayed line arrives
@@ -47,7 +51,7 @@ class FakeProc:
                     if isinstance(line, float):
                         time.sleep(line)
                     else:
-                        self.engine.lines.put(line)
+                        lines.put(line)
             self.player = threading.Thread(target=play, daemon=True)
             self.player.start()
             return
@@ -89,6 +93,7 @@ class FakeEngine(StrataEngine):
         self.fail = False
         self.script = None
         self.proc = FakeProc(self)
+        self.wlock = threading.Lock()
 
 
 class Slots(unittest.TestCase):
@@ -462,6 +467,180 @@ class Slots(unittest.TestCase):
         self.engine.script = ["SWAIT flush 1\n", 1.1, "FLUSHED 0 0 1100.0\n"]
         self.assertEqual(self.engine.session_file("flush", ""), {"tokens": 0, "bytes": 0, "ms": 1100.0})
         self.assertFalse(self.engine.proc.killed)
+
+    def test_old_exchange_cannot_consume_or_kill_successor(self):
+        for terminal in ("SAVED 1 2 3.0\n", "garbage\n"):
+            with self.subTest(terminal=terminal):
+                self.fresh_engine()
+                old, lines = self.engine.proc, self.engine.lines
+                self.engine.script = ["SWAIT transfer 1\n", 0.15, terminal]
+                output = {}
+                def exchange():
+                    try:
+                        output["result"] = self.engine.session_file("save", "old.bin")
+                    except EngineDied as e:
+                        output["error"] = e
+                thread = threading.Thread(target=exchange)
+                thread.start()
+                self.assertTrue(wait_until(lambda: hasattr(old, "player")))
+                successor = FakeProc(self.engine)
+                self.engine.proc, self.engine.lines = successor, queue.Queue()
+                self.engine.lines.put("SAVED 999 999 999.0\n")
+                try:
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive())
+                    self.assertFalse(successor.killed or self.engine.ended)
+                    if terminal == "garbage\n":
+                        self.assertIsInstance(output.get("error"), EngineDied)
+                        self.assertTrue(old.killed)
+                    else:
+                        self.assertEqual(output, {"result": {"tokens": 1, "bytes": 2, "ms": 3.0}})
+                    self.assertEqual(self.engine.lines.get_nowait(), "SAVED 999 999 999.0\n")
+                finally:
+                    self.engine.proc, self.engine.lines = old, lines
+                    old.player.join(2)
+
+    def test_timeout_only_ends_captured_process(self):
+        old, lines = self.engine.proc, self.engine.lines
+        self.engine.silence_s = 0.02
+        self.engine.script = []
+        successor = FakeProc(self.engine)
+        silent = self.engine._silent
+        def restart_at_timeout(what, **kwargs):
+            self.engine.proc, self.engine.lines = successor, queue.Queue()
+            return silent(what, **kwargs)
+        try:
+            with mock.patch.object(self.engine, "_silent", side_effect=restart_at_timeout):
+                with self.assertRaises(EngineDied):
+                    self.engine.session_file("save", "old.bin")
+            self.assertTrue(old.killed)
+            self.assertFalse(successor.killed or self.engine.ended)
+        finally:
+            self.engine.proc, self.engine.lines = old, lines
+
+
+class ConcurrentSlots(FakeEngineCase):
+    def setUp(self):
+        self.start(2, more=["--batch-session-files"])
+        self.svc.slot_save_path = self.tmp.name
+
+    def commands(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def post_slot(self, slot, action, filename):
+        req = urllib.request.Request(self.base + f"/slots/{slot}?action={action}",
+                                     data=json.dumps({"filename": filename}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_claims_before_control_without_fifo_and_restores_unknown_prefix(self):
+        out = {}
+        path = Path(self.tmp.name, "restore.bin")
+        path.write_bytes(b"session")
+        self.engine.slot_held[1] = [999, 998]
+        threads = [threading.Thread(target=lambda: out.update(save=self.post_slot(0, "save", "a b.bin"))),
+                   threading.Thread(target=lambda: out.update(restore=self.post_slot(1, "restore", "restore.bin")))]
+        with self.svc.fifo:
+            threads[0].start()
+            self.assertTrue(wait_until(lambda: any(line.startswith("BSAVE 0 ") for line in self.commands())))
+            with self.engine.slot_cv:
+                self.assertEqual(self.engine.pick_slot([9]), 1)  # the file claim does not reserve its sibling
+            threads[1].start()
+            self.assertTrue(wait_until(lambda: self.engine.slot_claims == {0, 1}))
+            with self.engine.slot_cv:
+                self.assertIsNone(self.engine.pick_slot([9]))
+            self.assertFalse(any(line.startswith("BRESTORE ") for line in self.commands()))
+            self.assertEqual(self.post_slot(0, "save", "busy.bin")[0], 409)
+            for thread in threads:
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual(out["save"], (200, {"id_slot": 0, "filename": "a b.bin", "n_saved": 7, "n_written": 7,
+                                           "timings": {"save_ms": 200.0}}))
+        self.assertEqual(out["restore"][0], 200)
+        self.assertEqual(out["restore"][1]["n_restored"], 7)
+        self.assertEqual(self.commands(), [f"BSAVE 0 {Path(self.tmp.name, 'a b.bin')}", f"BRESTORE 1 {path}"])
+        self.assertEqual(self.engine.slot_claims, set())
+        self.assertEqual(self.engine.slot_busy, [False, False])
+        self.assertEqual(self.engine.slot_held[1], [])
+
+    def test_busy_target_refused_while_idle_file_keeps_sibling_running(self):
+        cancel = [threading.Event(), threading.Event()]
+        output, failures = [[], []], []
+        def generate(i):
+            try:
+                for token in self.engine.generate(list(b"LONGREPLY"), 1000, {}, cancel[i]):
+                    if token is not None:
+                        output[i].append(token)
+            except Exception as e:
+                failures.append(e)
+        threads = [threading.Thread(target=generate, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        try:
+            self.assertTrue(wait_until(lambda: all(self.engine.slot_busy) and
+                all(live and live["state"] == "decoding" for live in self.engine.slot_live)))
+            self.assertEqual(self.post_slot(0, "save", "active.bin")[0], 409)
+            self.assertFalse(any(line.startswith("BSAVE ") for line in self.commands()))
+            cancel[1].set()
+            threads[1].join(5)
+            self.assertFalse(threads[1].is_alive())
+            self.assertTrue(wait_until(lambda: sum(self.engine.slot_busy) == 1))
+            active = self.engine.slot_busy.index(True)
+            before = len(output[0])
+            self.assertEqual(self.post_slot(1 - active, "save", "idle.bin")[0], 200)
+            self.assertGreater(len(output[0]), before)
+            self.assertTrue(threads[0].is_alive())
+            with self.assertRaisesRegex(SessionRefused, "busy"):
+                self.engine.session_file("save", str(Path(self.tmp.name, "busy.bin")), slot=active)
+            self.assertTrue(self.engine.alive())
+        finally:
+            for event in cancel:
+                event.set()
+            for thread in threads:
+                thread.join(5)
+        self.assertEqual(failures, [])
+
+    def test_restart_during_control_wait_cannot_send_to_or_release_successor(self):
+        old_proc, old_lines = self.engine.proc, self.engine.lines
+        old_busy, old_claims, old_held = self.engine.slot_busy, self.engine.slot_claims, self.engine.slot_held
+        output = {}
+        self.engine.ctl.acquire()
+        worker = threading.Thread(target=lambda: output.update(result=self.svc.slot_action("0", "save", "old.bin")))
+        worker.start()
+        self.assertTrue(wait_until(lambda: old_claims == {0}))
+        self.assertEqual(self.svc.unload(), "busy")
+        successor = FakeProc(self.engine)
+        self.engine.proc, self.engine.lines = successor, queue.Queue()
+        self.engine.lines.put("SAVED 999 999 999.0\n")
+        self.engine.slot_busy, self.engine.slot_claims, self.engine.slot_held = [True, False], {0}, [[999], []]
+        self.engine.ctl.release()
+        try:
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(output["result"][0], 503)
+            self.assertEqual(successor.sent, [])
+            self.assertEqual(self.engine.lines.get_nowait(), "SAVED 999 999 999.0\n")
+            self.assertEqual(self.commands(), [])
+            self.assertEqual(self.engine.slot_busy, [True, False])
+            self.assertEqual(self.engine.slot_claims, {0})
+            self.assertEqual(old_busy, [False, False])
+            self.assertEqual(old_claims, set())
+        finally:
+            self.engine.proc, self.engine.lines = old_proc, old_lines
+            self.engine.slot_busy, self.engine.slot_claims, self.engine.slot_held = old_busy, old_claims, old_held
+
+    def test_grouped_slots_and_missing_capability_keep_existing_refusal(self):
+        self.engine.slot_groups = 2
+        self.assertEqual(self.post_slot(0, "save", "group.bin")[0], 501)
+        self.engine.slot_groups = 1
+        self.engine.info.pop("session_slots")
+        self.assertEqual(self.post_slot(0, "save", "disabled.bin")[0], 501)
+        self.assertEqual(self.commands(), [])
 
 
 class DiskCacheArgs(unittest.TestCase):

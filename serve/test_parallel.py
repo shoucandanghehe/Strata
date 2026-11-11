@@ -47,6 +47,8 @@ print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else "") +
       (" unified_slots=1" if "--unified-slots" in args else "") +
       (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
+if "--batch-session-files" in args:
+    print("INFO session_slots=1", flush=True)
 if "--cache-async" in args:
     print("INFO session_cache_async=1", flush=True)
 if "--fake-stage-plan" in args:
@@ -105,6 +107,24 @@ while True:
         line = lines.get(timeout=STEP if active else None)
     except queue.Empty:
         line = ""
+    if line and line.startswith(("BSAVE ", "BRESTORE ")):
+        head, target, path = line.split(" ", 2)
+        slot = int(target)
+        if log:
+            log.write(line + "\n"); log.flush()
+        if slot in active:
+            print("SERR invalid 0 target slot is busy", flush=True)
+            continue
+        print("SWAIT flush 1", flush=True)
+        for _ in range(10):
+            time.sleep(0.02)
+            if active:
+                window()
+        if head == "BSAVE":
+            from pathlib import Path
+            Path(path).write_bytes(b"session")
+        print(f"{'SAVED' if head == 'BSAVE' else 'RESTORED'} 7 7 200.0", flush=True)
+        continue
     if line is None or line == "QUIT":
         if "--cache-async" in args:
             if "--shutdown-early" in args:

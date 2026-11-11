@@ -2978,14 +2978,14 @@ class StrataEngine:
         else:
             state["next"] = float("inf")   # no reading (psutil missing): nothing to decide on
 
-    def _silent(self, what: str) -> EngineSilent:
-        """#481: end an engine that lost step with the server (its main thread waits for a command the server never
-        sends), so the next request starts it again: killed now, its GPU and RAM go back with the process."""
-        self.silent_note = ("The engine and the server lost step (issue #481; a very slow PC can raise "
-                            "\"engine_silence_s\" in the config, 0 = wait forever). If it happens again, please add "
-                            "the end of the engine log to github.com/Niko1221/Strata/issues/481.")
-        self.ended = True                               # not alive from now: the next request restarts it
-        proc = self.proc
+    def _silent(self, what: str, *, proc: subprocess.Popen[str] | None = None) -> EngineSilent:
+        """End the process that lost step, without ending a successor after a restart."""
+        proc = self.proc if proc is None else proc
+        if self.proc is proc:
+            self.silent_note = ("The engine and the server lost step (issue #481; a very slow PC can raise "
+                                "\"engine_silence_s\" in the config, 0 = wait forever). If it happens again, please add "
+                                "the end of the engine log to github.com/Niko1221/Strata/issues/481.")
+            self.ended = True
         try:
             proc.kill()
             proc.wait(timeout=20)                       # restart() -> close() handles one that is still exiting
@@ -3003,12 +3003,13 @@ class StrataEngine:
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
 
-    def session_file(self, action: str, path: str) -> dict:
+    def session_file(self, action: str, path: str, slot: int | None = None, *, expected_proc: object | None = None) -> dict:
         with self._exclusive_control():
-            return self._session_file(action, path)
+            return self._session_file(action, path, slot, expected_proc=expected_proc)
 
-    def _session_file(self, action: str, path: str) -> dict:
-        """Disk sessions: `SAVE <path>` / `RESTORE <path>` or `FLUSH` between requests (the caller holds the service FIFO).
+    def _session_file(self, action: str, path: str, slot: int | None = None, *, expected_proc: object | None = None) -> dict:
+        """SAVE/RESTORE <path>, BSAVE/BRESTORE <slot> <path>, or FLUSH.
+        expected_proc binds the command to the process whose idle slot was claimed before waiting for ctl.
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
         malformed one, a bare ERR, an answer with negative counts or a non-finite time - means the two sides lost
@@ -3019,22 +3020,32 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
-        if action not in ("save", "restore", "flush") or any(c in path for c in "\r\n\0"):
+        if action not in ("save", "restore", "flush") or any(c in path for c in "\r\n\0") or \
+                (slot is not None and (action == "flush" or type(slot) is not int or not 0 <= slot < self.batch)):
             raise ValueError("invalid session command")
+        proc, lines = self.proc, self.lines
+        if expected_proc is not None and proc is not expected_proc:
+            raise EngineDied("the engine restarted before the session command was sent")
+        command = "FLUSH" if action == "flush" else (
+            f"B{action.upper()} {slot} {path}" if slot is not None else f"{action.upper()} {path}")
         try:
-            self.proc.stdin.write("FLUSH\n" if action == "flush" else f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
-            self.proc.stdin.flush()
-        except OSError:
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            with self.wlock:
+                if self.proc is not proc:
+                    raise EngineDied("the engine restarted before the session command was sent")
+                proc.stdin.write(command + "\n")
+                proc.stdin.flush()
+        except (OSError, AttributeError):
+            raise EngineDied("the engine stopped before the session command was sent") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
         want = {"save": "SAVED", "restore": "RESTORED", "flush": "FLUSHED"}[action]
 
         def out_of_step(line: str) -> EngineDied:
-            self.ended = True                               # not alive from now: the next request restarts it
+            if self.proc is proc:
+                self.ended = True
             try:
-                self.proc.kill()
-                self.proc.wait(timeout=20)
+                proc.kill()
+                proc.wait(timeout=20)
             except (OSError, AttributeError, subprocess.TimeoutExpired):
                 pass
             return EngineDied(f"the engine answered a session {action} with {line.strip()[:200]!r}; "
@@ -3053,12 +3064,15 @@ class StrataEngine:
             try:
                 if left is not None and left <= 0:
                     raise queue.Empty
-                line = self.lines.get(timeout=left)
+                line = lines.get(timeout=left)
             except queue.Empty:
+                if self.proc is not proc:
+                    raise EngineDied("the engine restarted during the session command") from None
                 raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
-                                   + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")) from None
+                                   + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else ""),
+                                   proc=proc) from None
             if line is None:
-                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {proc.poll()})")
             f = line.split()
             head = f[0] if f else ""
             if head == "SESSION":                          # a large file moving: progress, and a heartbeat
@@ -5057,12 +5071,13 @@ class Service:
                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
-        if getattr(self.engine, "batch", 0):
-            # #465 parallel requests do not hold the FIFO and share the engine's control lines: a session file
-            # could interleave with a request being admitted, so the two are not combined (the engine refuses too)
-            return error(501, "slot save/restore is not available with parallel requests (\"parallel\" / --batch)")
-        if slot != "0":
-            return error(400, "this server has one slot: 0")
+        batch = getattr(self.engine, "batch", 0)
+        if batch and (not (getattr(self.engine, "info", {}) or {}).get("session_slots") or
+                      getattr(self.engine, "slot_groups", 1) > 1):
+            return error(501, "slot save/restore is not available with these parallel requests")
+        if slot not in [str(i) for i in range(batch or 1)]:
+            return error(400, f"this server has slots 0..{batch - 1}" if batch else "this server has one slot: 0")
+        slot_id = int(slot)
         if action not in ("save", "restore"):
             return error(400, "action must be save or restore")
         why = slot_filename_problem(filename)
@@ -5079,18 +5094,41 @@ class Service:
             self.status["queued"] += 1
         waiting = True
         try:
-            with self.fifo:
+            with contextlib.ExitStack() as turn:
+                if batch:
+                    engine = self.engine
+                    with engine.slot_cv:
+                        busy, claims, held = engine.slot_busy, engine.slot_claims, engine.slot_held
+                        proc = engine.proc
+                        if busy[slot_id] or slot_id in claims or slot_id in engine.slot_releasing:
+                            return error(409, f"slot {slot_id} is busy")
+                        busy[slot_id] = True
+                        claims.add(slot_id)
+                    def release_slot():
+                        with engine.slot_cv:
+                            busy[slot_id] = False
+                            claims.discard(slot_id)
+                            engine.slot_cv.notify_all()
+                    turn.callback(release_slot)
+                else:
+                    turn.enter_context(self.fifo)
                 with self.status_lock:
                     self.status["queued"] -= 1
                 waiting = False
-                if not self.loaded():
+                if not self.loaded() or (batch and (self.engine.proc is not proc or
+                        busy is not self.engine.slot_busy or claims is not self.engine.slot_claims)):
                     return error(503, "the model is not loaded")
-                with self.status_lock:
-                    self.status.update(busy=True, phase="saving the session" if action == "save"
-                                       else "restoring a session", started=time.time(), first_token=None,
-                                       prompt_tokens=None, generated=None, max_tokens=None)
+                if not batch:
+                    with self.status_lock:
+                        self.status.update(busy=True, phase="saving the session" if action == "save"
+                                           else "restoring a session", started=time.time(), first_token=None,
+                                           prompt_tokens=None, generated=None, max_tokens=None)
                 try:
-                    if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
+                    if batch:
+                        r = engine.session_file(action, path, slot=slot_id, expected_proc=proc)
+                        if action == "restore":
+                            held[slot_id] = []           # token counts cannot identify the restored prefix
+                    elif action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
                         from serve.session_save_retry import session_file
                         r = session_file(self, action, path, SessionRefused)
                     else:
@@ -5101,20 +5139,25 @@ class Service:
                     if e.published:
                         body[1]["error"]["published"] = True
                     return body
+                except EngineDied:
+                    if batch and self.engine.proc is not proc:
+                        return error(503, "the engine restarted during the session command")
+                    raise
                 except ValueError as e:                     # the request itself (an invalid command)
                     return error(400, str(e))
                 finally:
-                    with self.status_lock:
-                        self.status["busy"] = False
+                    if not batch:
+                        with self.status_lock:
+                            self.status["busy"] = False
                     self.last_request_at = time.time()
         finally:
             if waiting:                                     # never reached the FIFO (an exception while waiting)
                 with self.status_lock:
                     self.status["queued"] -= 1
         if action == "save":
-            return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
+            return 200, {"id_slot": slot_id, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
-        return 200, {"id_slot": 0, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
+        return 200, {"id_slot": slot_id, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
                      "timings": {"restore_ms": r["ms"]}}
 
     def set_aliases(self, aliases) -> None:
@@ -5543,6 +5586,10 @@ class Service:
             with self.status_lock:
                 if self.status.get("busy") or self.status.get("queued"):
                     return "busy"
+            if getattr(self.engine, "batch", 0) and (getattr(self.engine, "info", {}) or {}).get("session_slots"):
+                with self.engine.slot_cv:
+                    if any(self.engine.slot_busy) or self.engine.slot_claims:
+                        return "busy"                    # includes slot files, which do not hold the FIFO
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
             self.engine.unload()

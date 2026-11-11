@@ -787,6 +787,16 @@ On CUDA/HIP, DFlash2 saves use a v2 extension for the drafter's private ring, ta
 and deferred context. The model identity includes its pack and draft vocabulary, and the configuration includes
 ring-log mode. Files without DFlash2 retain the v1 bytes. This extension is not supported on Metal or SYCL.
 
+For idle batch slots, also add `--batch-session-files` to the engine arguments (the config's `args` list).
+Use `/slots/{id}?action=save|restore` for that physical slot. This opt-in mode supports one CUDA GPU without
+pipelined groups, with each slot's actual MTP or DFlash2 owner. `--unified-slots` already provides these owners;
+legacy MTP batching needs `--batch-mtp`, and legacy DFlash2 batching needs its private slot drafters.
+The engine advertises `INFO session_slots=1` only in the supported mode. Native commands are
+`BSAVE <slot> <path>` and `BRESTORE <slot> <path>`. A busy target returns `409`; other slots can still accept work.
+File I/O occupies the engine's control thread, so sibling decoding can pause while the file is moved.
+An empty or incomplete slot cannot be saved. Files include target and private draft state, image identity
+and the deepest checkpoint. Restore leaves token-prefix matching to the engine, not a reported token count.
+
 - `DIR` becomes an absolute path at start and is created with mode 0700. Files are created with mode 0600 on Linux (on Windows
   they inherit the folder's permissions), nothing deletes them, and they are large (about 1.2 GB per 63K-token conversation).
   Keep `DIR` private to the user that runs Strata.
@@ -803,21 +813,24 @@ ring-log mode. Files without DFlash2 retain the v1 bytes. This extension is not 
   rope configuration, a loaded control vector and the arithmetic switches). Sampling, seeds, draft tuning and the expert
   tier are not in it. Do not change model files while their sessions are kept. The hash detects accidental corruption and does
   not authenticate a file: restore only files this engine wrote.
-- Errors: `501` without `--slot-save-path` or with parallel requests; `400` for a slot other than 0, an unknown action, a refused
-  file name or an invalid file; `404` for a missing file; `503` when the model is not loaded or RAM is short; `507` when the disk has
-  no room; `500` for other I/O failures or an engine that ended. `error.published: true` means a save failed after its new
+- Errors: `501` without `--slot-save-path`, or for parallel requests without supported `--batch-session-files`; `409` for a
+  busy target; `400` for an unknown slot or action, a refused file name or an invalid file; `404` for a missing file;
+  `503` when the model is not loaded or RAM is short; `507` when the disk has no room; `500` for other I/O failures or an
+  engine that ended. `error.published: true` means a save failed after its new
   file had replaced the old one. Requests must be `application/json` (else `415`) and come from no browser page, Strata's own
   page or a trusted origin.
-- Not supported with `--layer-split`, `--peer-device`, `--batch` or `--prompt-cache 0`. The engine has been run on Linux and CUDA
-  only for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
-  change later output.
+- Not supported with `--layer-split`, `--peer-device` or `--prompt-cache 0`. Batch use needs the explicit mode above;
+  Metal, HIP and SYCL do not advertise batch session files. Standalone files without DFlash2 keep the existing v1 bytes.
+  Batch GPU execution remains to be validated. Exact token replay across restarts is not guaranteed: expert residency
+  and CPU/GPU rounding can change later output.
 
 #### Automatic session cache (opt-in)
 
 `--session-cache-dir DIR --session-cache-mib N` enables the native background cache. It is off by default: no cache
-thread or storage access is started. It supports single-session MTP and DFlash2 on one CUDA/HIP GPU, with
-`--prompt-cache` above zero, no helper expert caches, no parallel slots and no layer split.
-Metal and SYCL are not supported.
+thread or storage access is started. It supports MTP and DFlash2 on one CUDA/HIP GPU, with `--prompt-cache`
+above zero, no helper expert caches and no layer split. For concurrent requests, add `--unified-slots` explicitly.
+Each physical slot captures its own target and drafter state. Eligible dirty sessions are saved before their slot is
+overwritten; `FLUSH` joins pending publication. Metal and SYCL are not supported.
 
 `--session-cache-slots N` limits logical conversations (default 8). `--session-cache-idle-seconds N` delays a completed
 conversation's save until it is idle (default 60); `--session-cache-min-tokens N` sets its minimum input length

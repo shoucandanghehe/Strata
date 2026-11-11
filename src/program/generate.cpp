@@ -867,6 +867,7 @@ struct Options {
     bool batch_groups_auto = false;   ///< --batch-groups auto (#417 stage 1): one group per stage of a layer split, if it divides --batch
     bool batch_mtp = false;      ///< --batch-mtp / STRATA_BATCH_MTP=1 (opt-in): one MTP proposal per batch slot
     bool unified_slots = false; ///< --unified-slots: a single-GPU request keeps its physical session from prefill to finish
+    bool batch_session_files = false; ///< --batch-session-files: save/restore complete idle CUDA slots
     std::string spec_oracle;
     int spec_corrupt = 0;
     /// Benchmarks and A/B checks (eddoursul's fork, F19): the run emits this continuation (token ids) instead of
@@ -1114,10 +1115,12 @@ void usage() {
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
+                 "  --batch-session-files  --serve: allow BSAVE/BRESTORE of idle batch slots (single CUDA GPU;\n"
+                 "                       private MTP/DFlash2 owners, no pipelined groups; default off)\n"
                  "  --session-cache-dir PATH --session-cache-mib N  async shared-block session cache (default off)\n"
                  "  --session-cache-slots N --session-cache-idle-seconds N --session-cache-min-tokens N\n"
                  "                       maximum entries, idle delay and minimum length (defaults 8, 60, 4096);\n"
-                 "                       CUDA/HIP only: single-session MTP/DFlash2 on one GPU, without parallel slots or layer split\n"
+                 "                       CUDA/HIP only; concurrent requests require explicit --unified-slots\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: sized from the free RAM, up to 8192; 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
@@ -3604,6 +3607,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--batch-mtp") o.batch_mtp = true;
         else if (a == "--unified-slots") o.unified_slots = true;
+        else if (a == "--batch-session-files") o.batch_session_files = true;
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
@@ -12248,6 +12252,7 @@ int main(int argc, char** argv) {
         std::optional<CacheRequest> main_request;
         bool main_disk_dirty = false;
         Clock::time_point main_disk_due;
+        std::function<void()> cache_idle_tick;
         std::string auto_cache_error;
         auto cache_failure = [&](const std::string& why) {
             std::fprintf(stderr, "strata session cache: %s\n", why.c_str());
@@ -12255,11 +12260,11 @@ int main(int argc, char** argv) {
         };
         auto cache_limits = [&](strata::core::SessionReadLimits& limits, std::string& why) {
             limits.progress = [](uint64_t, uint64_t) { strata::core::progress_beat(); };
-            if (!strata::core::conversation_session_read_limits(limits, ss, g,
-                    use_mtp ? &mtp.kv_state() : nullptr,
+            if (!strata::core::conversation_session_read_limits(limits, *request_state, g,
+                    use_mtp ? &request_draft->kv_state() : nullptr,
                     (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), why)) return false;
 #if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
-            if (use_df2) limits.dflash2 = df2.snapshot_limits((uint64_t) o.max_context);
+            if (use_df2) limits.dflash2 = request_df2->snapshot_limits((uint64_t) o.max_context);
 #endif
             limits.max_file_bytes = strata::core::session_read_max_file_bytes(limits);
             limits.admit = [&](uint64_t need, std::string& refusal) {
@@ -12275,9 +12280,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: session cache supports CUDA/HIP only, not Metal\n");
             return 2;
 #else
-            if (!stages.empty() || multi_gpu || o.peer_device >= 1 || remote_caches || o.prompt_cache <= 0 || o.batch > 0) {
-                std::fprintf(stderr, "strata serve: session cache needs one GPU, --prompt-cache > 0, "
-                                     "no helper caches, and no parallel slots or layer split\n");
+            if (!stages.empty() || multi_gpu || o.peer_device >= 1 || remote_caches || o.prompt_cache <= 0 ||
+                (o.batch > 0 && !unified_slots)) {
+                std::fprintf(stderr, "strata serve: session cache needs one GPU, --prompt-cache > 0, no helper "
+                                     "caches, and explicit --unified-slots for concurrent requests\n");
                 return 2;
             }
             strata::core::SessionFileIdentity identity;
@@ -12359,17 +12365,12 @@ int main(int argc, char** argv) {
                 (!force && Clock::now() < main_disk_due)) return;
             strata::core::SavedConversation image;
             const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
-            if (capture_disk(image, ss, use_mtp ? &mtp.kv_state() : nullptr,
+            if (capture_disk(image, *request_state, use_mtp ? &request_draft->kv_state() : nullptr,
 #if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
-                    use_df2 ? &df2 : nullptr,
+                    use_df2 ? request_df2 : nullptr,
 #endif
                     view, main_request->bytes()) &&
-                enqueue_disk(*main_request, std::move(image), (size_t) ss.qsa_alloc)) main_disk_dirty = false;
-        };
-        auto cache_idle_tick = [&] {
-            if (!session_cache) return;
-            persist_main(false);
-            session_cache->collect();
+                enqueue_disk(*main_request, std::move(image), (size_t) request_state->qsa_alloc)) main_disk_dirty = false;
         };
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
@@ -14343,6 +14344,18 @@ int main(int argc, char** argv) {
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
         if (session_cache) std::printf("INFO session_cache_async=1\n");
         if (unified_slots) std::printf("INFO unified_slots=1\n");
+        const char* slot_file_unavailable = !o.batch_session_files ? "batch session files need --batch-session-files"
+            : o.batch <= 0 ? "batch session files need --batch"
+            : o.prompt_cache <= 0 ? "batch session files need --prompt-cache > 0"
+            : !stages.empty() || multi_gpu || o.peer_device >= 1 ? "batch session files need one GPU"
+            : o.batch_groups > 1 ? "batch session files do not support pipelined groups"
+            : use_df2 && !fixed_df2 && !batch_df2 ? "batch session files need private DFlash2 owners"
+            : use_mtp && !slot_drafts ? "batch session files need private MTP owners" : nullptr;
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP) || defined(STRATA_USE_SYCL)
+        slot_file_unavailable = "batch session files support the CUDA backend only";
+#endif
+        const bool slot_session_files = slot_file_unavailable == nullptr;
+        if (slot_session_files) std::printf("INFO session_slots=1\n");
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -14545,10 +14558,14 @@ int main(int argc, char** argv) {
             int64_t reply0 = 0;            ///< the index in `ids` where its penalty window starts (the last prompt token; 0 with STRATA_PENALTY_PROMPT=1)
             int pen_n = 0;                 ///< its request's penalty window (penalty_last_n) when it has a repeat / frequency / presence penalty, else 0
             bool cached = false;           ///< idle, and its sessions still hold `ids`
+            bool file_valid = false;       ///< complete idle legacy slot, including final draft rows
             bool cvec = true;              ///< the control vector setting `ids` were read with
             bool img = false;              ///< the conversation has pictures (live-end reuse only in unified slots)
             std::vector<ImgKey> imgs;
             int64_t tail_ckpt_len = -1;
+            std::optional<CacheRequest> request;
+            bool disk_valid = false, disk_dirty = false, disk_eligible = true;
+            Clock::time_point disk_due;
             // the checkpoint its prompt read took at the last turn boundary (the history before the new turn's
             // header): a client's next turn renders the history again WITHOUT this reply's thinking, so it matches
             // the slot's tokens only up to there - the slot's K/V up to it plus this state continue from it
@@ -14570,10 +14587,33 @@ int main(int argc, char** argv) {
             std::swap(live_ok, sl.cached);
             std::swap(cvec_cached, sl.cvec);
             std::swap(tail_ckpt_len, sl.tail_ckpt_len);
+            main_request.swap(sl.request);
+            std::swap(main_disk_dirty, sl.disk_dirty);
+            std::swap(main_disk_due, sl.disk_due);
         };
         auto slot_draft_limit = [&](const BSlot& sl) {
             return sl.stop ? 0 : (int) std::max<int64_t>(0, std::min<int64_t>(slot_mtp_max_t,
                 std::min(sl.max_new - sl.produced, o.max_context - sl.p)) - 1);
+        };
+        auto persist_slot = [&](int b, bool force) {
+            BSlot& sl = bs[(size_t) b];
+            if (!session_cache || !sl.request || !sl.disk_valid || !sl.disk_dirty || sl.tainted ||
+                (int64_t) sl.request->ids.size() < o.session_cache_min_tokens ||
+                (!force && Clock::now() < sl.disk_due)) return;
+            strata::core::SavedConversation image;
+            const strata::core::ConversationView view{sl.ids, sl.imgs, sl.checks, sl.cvec};
+            if (capture_disk(image, *bslot_ss[0][(size_t) b], use_mtp ? &slot_mtp[(size_t) b]->kv_state() : nullptr,
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
+                    use_df2 ? slot_df2[(size_t) b].get() : nullptr,
+#endif
+                    view, sl.request->bytes()) && enqueue_disk(*sl.request, std::move(image),
+                    (size_t) bslot_ss[0][(size_t) b]->qsa_alloc)) sl.disk_dirty = false;
+        };
+        cache_idle_tick = [&] {
+            if (!session_cache) return;
+            persist_main(false);
+            for (int b = 0; b < (int) bs.size(); ++b) if (!bs[(size_t) b].active) persist_slot(b, false);
+            session_cache->collect();
         };
         // STRATA_BATCH_DF2_DEFER=0: every round drafts for every slot, spare rows or not (the first measurement's behaviour, for the A/B)
         // STRATA_BATCH_DF2_CONF=P (default: --draft-conf, else 0.35; 0 off): a slot's draft rows stop where the product of the selector's probabilities falls below P;
@@ -15087,7 +15127,8 @@ int main(int argc, char** argv) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                     std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
                     sl.active = false;
-                    sl.cached = false;
+                    sl.cached = sl.file_valid = false;
+                    sl.disk_valid = sl.disk_dirty = false;
                     sl.checks.clear();
                     nan_flush = true;
                     continue;
@@ -15105,13 +15146,14 @@ int main(int argc, char** argv) {
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && (!sl.img || unified_slots) && !sl.tainted;
+                        sl.file_valid = slot_session_files && !sl.tainted;
                         break;
                     }
                     sl.x = y;
                     sl.p += 1;
                 }
 #if defined(STRATA_HAVE_DFLASH2)
-                if ((batch_df2 && sl.active) || fixed_df2) {
+                if ((batch_df2 && (sl.active || slot_session_files)) || fixed_df2) {
                     // The slot's committed rows' taps (every stage's share, landed on the drafter's card) are its drafter's next context; its drafts follow
                     // from the last committed token.  The window's host sync is behind us, so the taps are final.
                     strata::core::Dflash2Drafter& d = *slot_df2[(size_t) b];
@@ -15206,6 +15248,20 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     sl.draft_ready = true;
+                } else if (slot_session_files && batch_mtp && !batch_df2 && !fixed_df2 && !sl.active) {
+                    // The legacy batch path also commits its terminal rows to its private draft owner.
+                    auto& d = *slot_mtp[(size_t) b];
+                    const strata::core::OnDevice on_slot_mtp(d.device());
+                    const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                    if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
+                                        ver.final_R_all() + (size_t) first[t] * stride,
+                                        (size_t) keep[b] * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                        d.stream()) != cudaSuccess ||
+                        !d.prefill(slot_mtp_rows[(size_t) b].get(), outb + first[t],
+                                   keep[b], pos[first[t]], err, false) || !d.idle(err)) {
+                        std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                        return false;
+                    }
                 }
             }
             if (fixed_drafts) for (int t = 0; t < A; ++t) {
@@ -15249,6 +15305,15 @@ int main(int argc, char** argv) {
                 sl.draft_ready = true;
             }
 #endif
+            if (session_cache) for (int t = 0; t < A; ++t) {
+                BSlot& sl = bs[(size_t) active[t]];
+                if (sl.active || !sl.cached) continue;
+                sl.disk_valid = o.prompt_cache > 0 && sl.disk_eligible && !sl.tainted;
+                sl.disk_dirty = sl.disk_valid;
+                sl.disk_due = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                    std::chrono::duration<double>(o.session_cache_idle_seconds));
+                persist_slot(active[t], false);
+            }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
             if (adapt_run.th.joinable()) {
@@ -15823,8 +15888,9 @@ int main(int argc, char** argv) {
                 strata::core::SessionReadLimits limits;
                 std::string why;
                 if (cache_limits(limits, why)) {
-                    bytes = limits.max_file_bytes > UINT64_MAX - bytes ? UINT64_MAX :
-                        bytes + limits.max_file_bytes;
+                    const uint64_t lanes = (uint64_t) bs.size() + 1;
+                    bytes = limits.max_file_bytes > (UINT64_MAX - bytes) / lanes ? UINT64_MAX :
+                        bytes + limits.max_file_bytes * lanes;
                 }
             }
             const int64_t seconds = strata::core::session_phase_limit_s(bytes);
@@ -15833,6 +15899,11 @@ int main(int argc, char** argv) {
             std::printf("SWAIT %s %lld\n", phase, (long long) seconds);
             std::fflush(stdout);
             persist_main(true);
+            for (int b = 0; b < (int) bs.size(); ++b) {
+                BSlot& sl = bs[(size_t) b];
+                if (shutdown && sl.active && !sl.tainted && sl.disk_eligible) sl.disk_valid = sl.disk_dirty = true;
+                if (!sl.active || shutdown) persist_slot(b, true);
+            }
             strata::core::progress_allow(seconds);
             std::string why = std::exchange(auto_cache_error, {}), next;
             if (session_cache && !session_cache->flush(next) && why.empty()) why = next;
@@ -15997,14 +16068,22 @@ int main(int argc, char** argv) {
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
             if (line == "FLUSH") { flush_cache("flush", false); continue; }
-            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
-                const bool save = line[0] == 'S';
-                const std::string path = line.substr(save ? 5 : 8);
-#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
-                const auto* file_draft = use_df2 && !use_mtp ? nullptr : &mtp.kv_state();
-#else
-                const auto& file_draft = mtp.kv_state();
-#endif
+            const bool batch_file = line.rfind("BSAVE ", 0) == 0 || line.rfind("BRESTORE ", 0) == 0;
+            if (batch_file || line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+                const bool save = batch_file ? line[1] == 'S' : line[0] == 'S';
+                int file_slot = -1;
+                std::string path;
+                bool bad_slot = false;
+                if (batch_file) {
+                    const size_t start = save ? 6 : 9;
+                    const size_t end = line.find(' ', start);
+                    long long value = -1;
+                    const auto parsed = std::from_chars(line.data() + start,
+                        line.data() + (end == std::string::npos ? line.size() : end), value);
+                    bad_slot = parsed.ec != std::errc{} || end == std::string::npos ||
+                               parsed.ptr != line.data() + end || value < 0 || value >= (long long) bs.size();
+                    if (!bad_slot) { file_slot = (int) value; path = line.substr(end + 1); }
+                } else path = line.substr(save ? 5 : 8);
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -16037,11 +16116,39 @@ int main(int argc, char** argv) {
                 // or writes the checkpoints (a join inside the session file writer would match only the copy of a checkpoint)
                 strata::core::conversation_checkpoint_join(nullptr);
                 strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: the last park's K/V)
+                if (batch_file && slot_file_unavailable) { refuse(slot_file_unavailable); continue; }
+                if (batch_file && bad_slot) { refuse("no such batch slot or malformed slot command"); continue; }
+                if (file_slot >= 0 && bs[(size_t) file_slot].active) { refuse("batch slot is busy"); continue; }
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
-                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (o.batch > 0 && !batch_file) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
+                // Use the physical target/drafter pair, never the admission session's stale copy.
+                auto& file_ss = file_slot < 0 ? ss : *bslot_ss[0][(size_t) file_slot];
+                auto& file_ids = file_slot < 0 ? live : bs[(size_t) file_slot].ids;
+                auto& file_imgs = file_slot < 0 ? live_imgs : bs[(size_t) file_slot].imgs;
+                auto& file_checks = file_slot < 0 ? checks : bs[(size_t) file_slot].checks;
+                auto& file_cvec = file_slot < 0 ? cvec_cached : bs[(size_t) file_slot].cvec;
+                auto& file_valid = file_slot < 0 ? live_ok : unified_slots
+                    ? bs[(size_t) file_slot].cached : bs[(size_t) file_slot].file_valid;
+#if defined(STRATA_GPU_METAL)
+                const auto& file_draft = mtp.kv_state(); // standalone Metal keeps its original reference interface
+#else
+                const auto* file_draft = file_slot < 0
+                    ? (use_df2 && !use_mtp ? nullptr : &mtp.kv_state())
+                    : slot_mtp.empty() ? nullptr : &slot_mtp[(size_t) file_slot]->kv_state();
+#endif
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
+                auto* file_df2 = !use_df2 ? nullptr
+                    : file_slot < 0 ? &df2 : slot_df2[(size_t) file_slot].get();
+#endif
+                auto& ss = file_ss;
+                auto& live = file_ids;
+                auto& live_imgs = file_imgs;
+                auto& checks = file_checks;
+                auto& cvec_cached = file_cvec;
+                auto& live_ok = file_valid;
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
@@ -16060,7 +16167,15 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (save) {
-                    if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    if (!live_ok || live.empty() || (file_slot >= 0 &&
+                            (bs[(size_t) file_slot].partial || bs[(size_t) file_slot].tainted))) {
+                        refuse("no complete session to save"); continue;
+                    }
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
+                    if (file_df2 && !file_df2->catch_up((int64_t) live.size(), err)) {
+                        refuse(err, strata::core::SessionError::io); continue;
+                    }
+#endif
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
                     try {
@@ -16084,14 +16199,14 @@ int main(int argc, char** argv) {
                             sl.tokens = live.size();
                             sl.images = live_imgs.size();
                             sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) +
-#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
-                                (file_draft ? 1 : 0);
-#else
+#if defined(STRATA_GPU_METAL)
                                 1;
+#else
+                                (file_draft ? 1 : 0);
 #endif
                         }
 #if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
-                        if (use_df2) sl.dflash2_bytes = df2.snapshot_bytes();
+                        if (file_df2) sl.dflash2_bytes = file_df2->snapshot_bytes();
 #endif
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         if (o.session_save_reclaim) {
@@ -16099,7 +16214,7 @@ int main(int argc, char** argv) {
                                 checks, conversations, sl, floor, strata::core::available_host_bytes);
                             if (freed.bytes || freed.checkpoints || freed.parked) {
                                 // A removed tail must not mark a later checkpoint at this length as a tail.
-                                if (tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
+                                if (file_slot < 0 && tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
                                         return int64_t(c.ids.size()) == tail_ckpt_len;
                                     })) tail_ckpt_len = -1;
                                 std::fprintf(stderr, "strata serve: save reclaimed %zu checkpoints, %zu parked, "
@@ -16135,9 +16250,9 @@ int main(int argc, char** argv) {
                             continue;
                         }
 #if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
-                        if (use_df2) {
+                        if (file_df2) {
                             meta.dflash2.emplace();
-                            if (!df2.snapshot(*meta.dflash2, err)) {
+                            if (!file_df2->snapshot(*meta.dflash2, err)) {
                                 refuse(err, strata::core::SessionError::io);
                                 continue;
                             }
@@ -16190,8 +16305,8 @@ int main(int argc, char** argv) {
                             continue;
                         }
 #if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
-                        if (use_df2) {
-                            limits.dflash2 = df2.snapshot_limits((uint64_t) o.max_context);
+                        if (file_df2) {
+                            limits.dflash2 = file_df2->snapshot_limits((uint64_t) o.max_context);
                             limits.max_file_bytes = strata::core::session_read_max_file_bytes(limits);
                         }
 #endif
@@ -16208,16 +16323,16 @@ int main(int argc, char** argv) {
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
 #if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
-                    if (use_df2 != image.dflash2.has_value()) {
+                    if ((file_df2 != nullptr) != image.dflash2.has_value()) {
                         refuse("session file draft state does not match the selected session");
                         continue;
                     }
-                    if (use_df2 && !df2.validate_snapshot(*image.dflash2, err)) {
+                    if (file_df2 && !file_df2->validate_snapshot(*image.dflash2, err)) {
                         refuse(err);
                         continue;
                     }
-                    if (use_df2 && !strata::core::conversation_memory_admit(
-                            strata::core::available_host_bytes(), df2.restore_bytes(*image.dflash2),
+                    if (file_df2 && !strata::core::conversation_memory_admit(
+                            strata::core::available_host_bytes(), file_df2->restore_bytes(*image.dflash2),
                             (uint64_t) o.conversation_cache_min_free_mib << 20)) {
                         refuse("not enough RAM to restore the DFlash2 state", strata::core::SessionError::memory);
                         continue;
@@ -16227,28 +16342,36 @@ int main(int argc, char** argv) {
                         refuse(err);
                         continue;
                     }
-                    persist_main(true);
-                    if (session_cache) {
-                        const uint64_t pending = session_cache->pending_bytes();
-                        CacheWaitAllowance waiting(pending);
-                        blocking("cache", pending);
-                        session_cache->drain();
+                    if (file_slot < 0) {
+                        persist_main(true);
+                        if (session_cache) {
+                            const uint64_t pending = session_cache->pending_bytes();
+                            CacheWaitAllowance waiting(pending);
+                            blocking("cache", pending);
+                            session_cache->drain();
+                        }
+                        main_request.reset();
+                        main_disk_dirty = false;
+                    } else {
+                        persist_slot(file_slot, true);
+                        BSlot& owner = bs[(size_t) file_slot];
+                        owner.request.reset();
+                        owner.disk_valid = owner.disk_dirty = false;
+                        owner.disk_eligible = false;
                     }
-                    main_request.reset();
-                    main_disk_dirty = false;
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
-                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
+                    if (file_slot < 0 && !kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
                     }
-                    conversations.take_reuse();   // retained K/V described the outgoing session
+                    if (file_slot < 0) conversations.take_reuse();   // retained K/V described the outgoing main session
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
                     bool restored = strata::core::conversation_snapshot_restore(image, ss, g, file_draft, err) ==
                         strata::core::ConversationRestore::restored;
 #if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
-                    if (restored && use_df2) restored = df2.restore(*image.dflash2, err);
+                    if (restored && file_df2) restored = file_df2->restore(*image.dflash2, err);
 #endif
                     if (!restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
@@ -16266,7 +16389,19 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
-                    if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
+                    if (file_slot >= 0) {
+                        BSlot& sl = bs[(size_t) file_slot];
+                        sl.cached = unified_slots || live_imgs.empty();
+                        sl.file_valid = true;
+                        sl.img = !live_imgs.empty();
+                        sl.partial = sl.partial_from0 = sl.tainted = false;
+                        sl.partial_plan = {};
+                        sl.tail_ckpt_len = -1;
+                        sl.draft_ready = false;
+                        sl.n_drafts = 0;
+                        sl.proposal = {};
+                    }
+                    if (file_slot < 0 && nan_flush) {   // the standalone file replaced the poisoned main session
                         nan_flush = false;
                         const size_t n_parked = conversations.clear();
                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
@@ -16307,6 +16442,7 @@ int main(int argc, char** argv) {
                     exchange_request_cache(owner);
                     exchange_request_cache(standalone_cache);
                     owner.cached = owner.cached && !owner.tainted;
+                    owner.disk_valid = owner.cached && owner.disk_eligible;
                     request_state = &ss;
                     request_draft = &mtp;
 #if defined(STRATA_HAVE_DFLASH2)
@@ -16709,9 +16845,11 @@ int main(int argc, char** argv) {
                 tail_ckpt_len = -1;
                 const size_t n_parked = conversations.clear();
                 size_t n_slots = 0, n_running = 0;
-                for (BSlot& sl : bs)
+                for (BSlot& sl : bs) {
+                    sl.file_valid = false;
                     if (sl.active) {   // a running slot finishes its reply, but is not kept as a cache after it
                         sl.tainted = true;
+                        sl.disk_valid = sl.disk_dirty = false;
                         ++n_running;
                         // STRATA_SLOT_CKPT_MOVE reads a running slot's checkpoints (and a finished one's: lent_slot):
                         // they predate the flush, so they go now
@@ -16723,9 +16861,11 @@ int main(int argc, char** argv) {
                     } else if (sl.cached) {
                         sl.cached = false;
                         sl.partial = false;
+                        sl.disk_valid = sl.disk_dirty = false;
                         sl.checks.clear();
                         ++n_slots;
                     }
+                }
                 std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
                                      "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
                                      "not kept after their reply); reading this prompt from token 0\n", n_checks,
@@ -16787,13 +16927,13 @@ int main(int argc, char** argv) {
                 owner.partial_plan = {};
             }
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-            if (o.prompt_cache > 0 && req_imgs.empty())
+            if (o.prompt_cache > 0 && (req_imgs.empty() || slot_session_files))
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
-                    const bool idle_source = !sl.active && sl.cached;
+                    const bool idle_source = !sl.active && (sl.cached || (slot_session_files && sl.file_valid));
                     // (an active slot only where the drafter's rows come along or are not drafted from: the copy
                     // takes the main layers' cells, so the main drafter would keep another conversation's below it)
-                    const bool active_source = sl.active && !sl.tainted && slot_ckpt_move_env() &&
+                    const bool active_source = req_imgs.empty() && sl.active && !sl.tainted && slot_ckpt_move_env() &&
                                                (!use_mtp || slot_drafts || admit_slot >= 0);
                     if (sl.cvec != want_cvec || !(idle_source || active_source)) continue;
                     if (idle_source && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, sl.imgs)) {
@@ -17083,11 +17223,12 @@ int main(int argc, char** argv) {
                     const bool move_cks = slot_ckpt_move_env() && admit_slot == slot_source;
                     const int64_t ck_len = slot_ck != nullptr ? (int64_t) slot_ck->ids.size() : -1;
                     std::vector<ConvCheckpoint>& sc = bs[(size_t) slot_source].checks;
-                    // a shorter checkpoint comes along only when it is a prefix of the tokens copied back (text only):
+                    // A shorter checkpoint comes along only with matching tokens and image identity:
                     // its cells are then the ones the main session holds
                     const std::vector<int32_t> copied_back = slot_ck != nullptr ? slot_ck->ids : bs[(size_t) slot_source].ids;
+                    const std::vector<ImgKey> copied_imgs = slot_ck != nullptr ? slot_ck->imgs : bs[(size_t) slot_source].imgs;
                     auto prefix_of_copied = [&](const ConvCheckpoint& c) {
-                        return c.imgs.empty() && c.ids.size() <= copied_back.size() &&
+                        return c.imgs == imgs_below(copied_imgs, (int64_t) c.ids.size()) && c.ids.size() <= copied_back.size() &&
                                std::equal(c.ids.begin(), c.ids.end(), copied_back.begin());
                     };
                     // the one continued from first, exactly as before this change (its copy is the one the request needs)
@@ -17129,7 +17270,7 @@ int main(int argc, char** argv) {
                     } else {
                         live = bs[(size_t) slot_source].ids;
                     }
-                    live_imgs.clear();
+                    live_imgs = slot_ck != nullptr ? slot_ck->imgs : bs[(size_t) slot_source].imgs;
                     resume = slot_tokens;
                     from_live = true;
                     std::fprintf(stderr, "strata batch: slot %d gave back %lld tokens of this conversation (%s) in "
@@ -17926,6 +18067,7 @@ int main(int argc, char** argv) {
                     }
                     if (segs.size() < 2) return sp.run(lead.tokens, lead.n, lead.pos0, ce);
                     for (const CoReq* c : used) {
+                        persist_slot(c->slot, true);
                         park_slot(c->slot);   // the conversation the slot holds, before this read overwrites it
                         for (size_t k = 0; k < bslot_ss.size(); ++k) {
                             const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
@@ -18105,7 +18247,7 @@ int main(int argc, char** argv) {
                         err = "yield";
                         return true;
                     }
-                    if (can) bs[(size_t) ys].cached = false;   // half written
+                    if (can) bs[(size_t) ys].cached = bs[(size_t) ys].file_valid = false;   // half written
                     std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                  (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     return false;
@@ -20355,6 +20497,7 @@ int main(int argc, char** argv) {
                 sl.max_new = admit_max_new;
                 sl.t0 = Clock::now();
                 sl.img = !live_imgs.empty();
+                sl.disk_eligible = req_ckpt;
                 sl.tainted = nf_hit;
                 sl.partial = yielded_at >= 0;
                 if (!sl.partial) sl.partial_plan = {};
@@ -20443,7 +20586,7 @@ int main(int argc, char** argv) {
                 if (cont) park_slot(admit_slot);   // the conversation the slot holds, before this one overwrites it
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
-                    bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
+                    bs[(size_t) admit_slot].cached = bs[(size_t) admit_slot].file_valid = false;
                     cont = false;
                 }
                 const auto tc1 = Clock::now();
@@ -20500,6 +20643,7 @@ int main(int argc, char** argv) {
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
+                    if (slot_session_files) sl.imgs = live_imgs;
                     const ConvCheckpoint* best = nullptr;
                     size_t best_at = 0;   // its place in `checks` (STRATA_SLOT_CKPT_MOVE)
                     for (size_t i = 0; i < checks.size(); ++i) {
