@@ -179,6 +179,58 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(self.engine.loaded)
         self.assertEqual(self.request("/v1/unload", {}, {"Authorization": "Bearer local-secret"})[0], 200)
 
+    def test_failed_close_is_a_server_error_and_does_not_block_reloading(self):
+        for path in ("/unload", "/v1/unload"):
+            for failure, expected in ((SessionRefused("io", "pending write failed"), 500),
+                                      (EngineDied("shutdown barrier missing"), 503)):
+                with self.subTest(path=path, failure=type(failure).__name__):
+                    self.engine.restart()
+                    close = self.engine.close
+                    def failed_close():
+                        close()
+                        raise failure
+                    with mock.patch.object(self.engine, "close", side_effect=failed_close):
+                        code, body = self.request(path, {})
+                    self.assertEqual(code, expected)
+                    self.assertEqual(body["error"]["type"], "server_error")
+                    self.assertIn(str(failure), body["error"]["message"])
+                    self.assertFalse(self.request("/v1/status")[1]["loaded"])
+                    self.assertEqual(self.request("/v1/load", {})[0], 200)
+                    self.assertEqual(self.request(path, {})[0], 200)
+
+    def test_idle_unload_continues_after_close_errors(self):
+        class StopLoop(Exception):
+            pass
+        for failure in (SessionRefused("io", "pending write failed"), EngineDied("shutdown barrier missing")):
+            with self.subTest(failure=type(failure).__name__):
+                self.engine.restart()
+                self.svc.idle_unload_s = 1
+                self.svc.last_request_at = time.time() - 10
+                close = self.engine.close
+                turns = 0
+                def sleep(_):
+                    nonlocal turns
+                    turns += 1
+                    if turns == 2:
+                        self.engine.restart()
+                    if turns == 3:
+                        raise StopLoop()
+                def failed_close():
+                    close()
+                    if turns == 1:
+                        raise failure
+                with mock.patch("serve.server.threading.Thread") as thread:
+                    self.svc.start_idle_unload()
+                loop = thread.call_args.kwargs["target"]
+                with mock.patch("serve.server.time.sleep", side_effect=sleep), \
+                        mock.patch.object(self.engine, "close", side_effect=failed_close) as closing, \
+                        mock.patch("builtins.print") as report:
+                    with self.assertRaises(StopLoop):
+                        loop()
+                self.assertEqual(closing.call_count, 2)
+                self.assertFalse(self.engine.alive())
+                self.assertTrue(any(str(failure) in str(call) for call in report.call_args_list))
+
     def test_an_engine_that_died_on_load_is_reported_as_such(self):
         # EngineDied is a RuntimeError: it keeps its own answer ("the next request restarts it")
         def died():
@@ -310,11 +362,20 @@ class CacheShutdown(FakeEngineCase):
         self.assertEqual(self.log.read_text().splitlines(), ["SHUTDOWN committed"])
         self.assertIsNone(self.engine.proc)
 
-    def test_flush_error_is_reported_after_the_process_is_closed(self):
+    def test_unload_reports_flush_error_after_the_process_is_closed(self):
         self.start(2, more=["--cache-async", "--flush-error"])
-        with self.assertRaisesRegex(SessionRefused, "pending write failed"):
-            self.engine.close()
+        req = urllib.request.Request(self.base + "/unload", data=b"{}",
+                                     headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as response:
+            urllib.request.urlopen(req, timeout=10)
+        with response.exception as error:
+            self.assertEqual(error.code, 500)
+            body = json.load(error)
+        self.assertEqual(body["error"]["type"], "server_error")
+        self.assertEqual(body["error"]["kind"], "io")
+        self.assertIn("pending write failed", body["error"]["message"])
         self.assertIsNone(self.engine.proc)
+        self.assertTrue(self.engine.unloaded)
         self.assertEqual(self.log.read_text().splitlines(), ["FLUSH", "SHUTDOWN committed"])
 
     def test_shutdown_error_is_reported_without_consuming_control_replies(self):

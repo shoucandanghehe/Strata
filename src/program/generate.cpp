@@ -1116,7 +1116,7 @@ void usage() {
                  "  --session-cache-dir PATH --session-cache-mib N  async shared-block session cache (default off)\n"
                  "  --session-cache-slots N --session-cache-idle-seconds N --session-cache-min-tokens N\n"
                  "                       maximum entries, idle delay and minimum length (defaults 8, 60, 4096);\n"
-                 "                       single-session MTP/DFlash2 on one GPU, without parallel slots or layer split\n"
+                 "                       CUDA/HIP only: single-session MTP/DFlash2 on one GPU, without parallel slots or layer split\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: sized from the free RAM, up to 8192; 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
@@ -12104,7 +12104,7 @@ int main(int argc, char** argv) {
                     for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
                     files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
                 }
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                 if (use_df2) {
                     files.push_back({"dflash2 pack", o.draft_model});
                     if (!strata::core::Dflash2Drafter::head_native())
@@ -12148,7 +12148,7 @@ int main(int argc, char** argv) {
                     {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
                     {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
                     {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                 if (use_df2) c.switches.emplace_back("dflash2_ring_log", df2.ring_log_on());
 #endif
                 config_fp = strata::core::session_config_fingerprint(c);
@@ -12172,7 +12172,7 @@ int main(int argc, char** argv) {
             if (!strata::core::conversation_session_read_limits(limits, ss, g,
                     use_mtp ? &mtp.kv_state() : nullptr,
                     (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), why)) return false;
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
             if (use_df2) limits.dflash2 = df2.snapshot_limits((uint64_t) o.max_context);
 #endif
             limits.max_file_bytes = strata::core::session_read_max_file_bytes(limits);
@@ -12185,6 +12185,10 @@ int main(int argc, char** argv) {
             return true;
         };
         if (!o.session_cache_dir.empty() && o.session_cache_mib > 0 && o.session_cache_slots > 0) {
+#if defined(STRATA_GPU_METAL)
+            std::fprintf(stderr, "strata serve: session cache supports CUDA/HIP only, not Metal\n");
+            return 2;
+#else
             if (!stages.empty() || multi_gpu || o.peer_device >= 1 || remote_caches || o.prompt_cache <= 0 || o.batch > 0) {
                 std::fprintf(stderr, "strata serve: session cache needs one GPU, --prompt-cache > 0, "
                                      "no helper caches, and no parallel slots or layer split\n");
@@ -12203,24 +12207,34 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: session cache initialization failed: %s\n", e.what());
                 return 1;
             }
+#endif
         }
+        // The writer has no caller progress callback. Bound joins by its pending bytes and restore the caller's
+        // allowance on every exit, including write failures.
+        struct CacheWaitAllowance {
+            int64_t previous = strata::core::progress().allow_until_ms.load();
+            explicit CacheWaitAllowance(uint64_t bytes) {
+                strata::core::progress_allow(strata::core::session_phase_limit_s(bytes));
+            }
+            ~CacheWaitAllowance() { strata::core::progress().allow_until_ms.store(previous); }
+        };
         auto capture_disk = [&](strata::core::SavedConversation& image, const strata::core::SessionState& target,
                                 const strata::core::QsaState* draft,
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                                 strata::core::Dflash2Drafter* df2_owner,
 #endif
                                 const strata::core::ConversationView& view, size_t request_bytes) {
-            const int64_t allowance = strata::core::progress().allow_until_ms.load();
             try {
-                strata::core::progress_allow(strata::core::session_phase_limit_s(session_cache->pending_bytes()));
-                session_cache->wait_for_room(); // bound owned snapshots BEFORE allocating the next capture
-                strata::core::progress().allow_until_ms.store(allowance);
+                {
+                    CacheWaitAllowance waiting(session_cache->pending_bytes());
+                    session_cache->wait_for_room(); // bound owned snapshots BEFORE allocating the next capture
+                }
                 size_t estimate = 0;
                 std::string why;
                 if (!ver.wait_commit(why) || !strata::core::conversation_snapshot_bytes(view, target, g, draft, estimate, why)) {
                     cache_failure(why); return false;
                 }
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                 if (df2_owner) estimate += df2_owner->snapshot_bytes();
 #endif
                 if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(), estimate + request_bytes,
@@ -12230,7 +12244,7 @@ int main(int argc, char** argv) {
                 if (!strata::core::conversation_snapshot_save(image, view, target, g, draft, why)) {
                     cache_failure(why); return false;
                 }
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                 if (df2_owner) {
                     image.dflash2.emplace();
                     if (!df2_owner->snapshot(*image.dflash2, why)) {
@@ -12242,7 +12256,6 @@ int main(int argc, char** argv) {
                 strata::core::conversation_park_join();
                 return true;
             } catch (const std::exception& e) {
-                strata::core::progress().allow_until_ms.store(allowance);
                 cache_failure(e.what()); return false;
             }
         };
@@ -12261,7 +12274,7 @@ int main(int argc, char** argv) {
             strata::core::SavedConversation image;
             const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
             if (capture_disk(image, ss, use_mtp ? &mtp.kv_state() : nullptr,
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                     use_df2 ? &df2 : nullptr,
 #endif
                     view, main_request->bytes()) &&
@@ -15756,7 +15769,11 @@ int main(int argc, char** argv) {
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
                 const bool save = line[0] == 'S';
                 const std::string path = line.substr(save ? 5 : 8);
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                 const auto* file_draft = use_df2 && !use_mtp ? nullptr : &mtp.kv_state();
+#else
+                const auto& file_draft = mtp.kv_state();
+#endif
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -15835,9 +15852,14 @@ int main(int argc, char** argv) {
                             sl.state_bytes = state;
                             sl.tokens = live.size();
                             sl.images = live_imgs.size();
-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + (file_draft ? 1 : 0);
+                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) +
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
+                                (file_draft ? 1 : 0);
+#else
+                                1;
+#endif
                         }
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                         if (use_df2) sl.dflash2_bytes = df2.snapshot_bytes();
 #endif
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
@@ -15881,7 +15903,7 @@ int main(int argc, char** argv) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                         if (use_df2) {
                             meta.dflash2.emplace();
                             if (!df2.snapshot(*meta.dflash2, err)) {
@@ -15936,7 +15958,7 @@ int main(int argc, char** argv) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                         if (use_df2) {
                             limits.dflash2 = df2.snapshot_limits((uint64_t) o.max_context);
                             limits.max_file_bytes = strata::core::session_read_max_file_bytes(limits);
@@ -15954,7 +15976,7 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                     if (use_df2 != image.dflash2.has_value()) {
                         refuse("session file draft state does not match the selected session");
                         continue;
@@ -15975,7 +15997,12 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     persist_main(true);
-                    if (session_cache) session_cache->drain();
+                    if (session_cache) {
+                        const uint64_t pending = session_cache->pending_bytes();
+                        CacheWaitAllowance waiting(pending);
+                        blocking("cache", pending);
+                        session_cache->drain();
+                    }
                     main_request.reset();
                     main_disk_dirty = false;
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
@@ -15989,7 +16016,7 @@ int main(int argc, char** argv) {
                     blocking("transfer", bytes);
                     bool restored = strata::core::conversation_snapshot_restore(image, ss, g, file_draft, err) ==
                         strata::core::ConversationRestore::restored;
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                     if (restored && use_df2) restored = df2.restore(*image.dflash2, err);
 #endif
                     if (!restored) {
@@ -16545,7 +16572,11 @@ int main(int argc, char** argv) {
                     size_t bytes = 0;
                     std::string why;
                     try {
-                        const bool loaded = session_cache->read(disk_match, image, bytes, why);
+                        bool loaded;
+                        {
+                            CacheWaitAllowance waiting(session_cache->pending_bytes());
+                            loaded = session_cache->read(disk_match, image, bytes, why);
+                        }
                         if (loaded) {
                             const auto current = strata::core::DiskSessionCache::match(image, ids, req_imgs, want_cvec,
                                 (size_t) ss.qsa_alloc + (use_mtp ? 1 : 0));
@@ -16557,7 +16588,7 @@ int main(int argc, char** argv) {
                         const bool fits = improves && kvg_ensure((int64_t) image.live.ids.size() + 256, kv_quiesce);
                         bool valid = fits && strata::core::conversation_snapshot_validate(image, ss, g,
                             use_mtp ? &mtp.kv_state() : nullptr, why);
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                         if (valid && use_df2) {
                             if (!image.dflash2) {
                                 why = "cached session is missing its DFlash2 state";
@@ -16568,7 +16599,7 @@ int main(int argc, char** argv) {
                         if (loaded && fits && !valid) session_cache->reject(disk_match, why);
                         if (improves && !fits) why = "the K/V cannot grow to the cached session";
                         bool restore_room = valid;
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                         if (valid && use_df2 && !strata::core::conversation_memory_admit(
                                 strata::core::available_host_bytes(), df2.restore_bytes(*image.dflash2),
                                 (uint64_t) o.conversation_cache_min_free_mib << 20)) {
@@ -16862,7 +16893,7 @@ int main(int argc, char** argv) {
                 bool restored = strata::core::conversation_snapshot_restore(*incoming, ss, g,
                         use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) ==
                     strata::core::ConversationRestore::restored;
-#if defined(STRATA_HAVE_DFLASH2)
+#if defined(STRATA_HAVE_DFLASH2) && !defined(STRATA_GPU_METAL)
                 if (restored && disk_incoming && use_df2) restored = df2.restore(*incoming->dflash2, err);
 #endif
                 if (!restored) {
@@ -16917,6 +16948,7 @@ int main(int argc, char** argv) {
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 if (disk_incoming) {
                     std::string why;
+                    CacheWaitAllowance waiting(session_cache->pending_bytes());
                     if (!session_cache->touch(disk_match, why)) cache_failure(why);
                     std::fprintf(stderr, "strata session cache: restored %lld tokens (%s)\n",
                                  (long long) resume, from_live ? "live" : "checkpoint");
